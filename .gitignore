@@ -1,0 +1,38 @@
+# Environment & Secrets (Zero-Trust Storage)
+.env
+*.env
+*.pem
+*.key
+*.crt
+
+# Go Endpoint Agent
+agent/bin/
+agent/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Python FastAPI Server
+server/__pycache__/
+server/*/__pycache__/
+*.py[cod]
+*$py.class
+server/.venv/
+.venv/
+server/alembic/versions/*_temp.py
+
+# React Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.cache/
+
+# Local Persistence & Volumes
+postgres_data/
+redis_data/
+
+# OS & Editor Metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
