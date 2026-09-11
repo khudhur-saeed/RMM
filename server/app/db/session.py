@@ -7,17 +7,9 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-# Read credentials from environment or fallback to verified local defaults
-POSTGRES_USER = os.getenv("POSTGRES_USER", "rmm_user")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "rmm_secure_dev_pass_2026")
-POSTGRES_DB = os.getenv("POSTGRES_DB", "tactical_rmm")
-POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
-POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5433")
+from app.core.config import settings
 
-DATABASE_URL = (
-    f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
-    f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
-)
+DATABASE_URL = settings.async_database_url 
 
 # Asynchronous connection engine with connection pooling
 engine = create_async_engine(
