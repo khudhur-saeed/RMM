@@ -1,37 +1,34 @@
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import health, organizations, sites, tokens, agents
+from app.api.v1.endpoints import agents, enroll, organizations, sites, tokens
 
 api_v1_router = APIRouter()
 
-# Aggregate endpoint routers
-api_v1_router.include_router(
-    health.router,
-    tags=["System Diagnostics"],
-)
-
-# Multi-Tenant Organizations Management
+# Multi-Tenant Core Boundaries
 api_v1_router.include_router(
     organizations.router,
     prefix="/organizations",
     tags=["Organizations"],
 )
-
-# Physical & Logical Sites Management
 api_v1_router.include_router(
     sites.router,
     prefix="/sites",
     tags=["Sites"],
 )
-
-# Agent Enrollment Tokens Management
 api_v1_router.include_router(
     tokens.router,
     prefix="/tokens",
     tags=["Enrollment Tokens"],
 )
 
-# Managed Endpoint Agents
+# Dedicated Single-Use Agent Enrollment Subsystem
+api_v1_router.include_router(
+    enroll.router,
+    prefix="/enroll",
+    tags=["Enrollment"],
+)
+
+# Operational Telemetry & Fleet Management
 api_v1_router.include_router(
     agents.router,
     prefix="/agents",

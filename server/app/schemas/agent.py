@@ -35,21 +35,32 @@ class AgentEnroll(AgentBase):
     )
 
 
-class AgentRead(AgentBase):
-    """Outbound serialization schema returned to API clients and dashboards."""
-    id: UUID
-    site_id: UUID
-    public_ip: Optional[str] = None
-    last_seen: datetime
-    created_at: datetime
-
-    model_config = ConfigDict(from_attributes=True)
-    
-
 class AgentHeartbeat(BaseModel):
     """Inbound validation schema for periodic agent telemetry and keep-alive."""
     private_ip: Optional[str] = Field(
         default=None,
         max_length=45,
         description="Updated local private IP address if changed",
+    )
+
+
+class AgentRead(AgentBase):
+    """Outbound serialization schema returned to API clients and dashboards."""
+    id: UUID
+    site_id: UUID
+    public_ip: Optional[str] = None
+    last_seen: Optional[datetime] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AgentEnrollResponse(AgentRead):
+    """
+    Outbound schema returned strictly once upon successful enrollment.
+    Delivers the plaintext agent API key to the endpoint daemon.
+    """
+    api_key: str = Field(
+        ...,
+        description="Cryptographically generated raw API key. Only returned once during enrollment.",
     )

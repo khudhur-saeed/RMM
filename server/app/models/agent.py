@@ -39,6 +39,12 @@ class Agent(Base):
         String(64),
         nullable=False,
     )
+    api_key_hash: Mapped[str] = mapped_column(
+        String(64),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
     public_ip: Mapped[Optional[str]] = mapped_column(
         String(45),
         nullable=True,
