@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import agents, enroll, organizations, sites, tokens
+from app.api.v1.endpoints import agents, enroll, organizations, sites, tokens, ws
 
 api_v1_router = APIRouter()
 
@@ -33,4 +33,11 @@ api_v1_router.include_router(
     agents.router,
     prefix="/agents",
     tags=["Agents"],
+)
+
+# Real-Time Full-Duplex Command & Telemetry Tunnels
+api_v1_router.include_router(
+    ws.router,
+    prefix="/ws",
+    tags=["WebSockets"],
 )
