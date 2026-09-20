@@ -51,7 +51,8 @@ async def agent_websocket_endpoint(
 ):
     """
     Secure full-duplex WebSocket endpoint for enrolled agents.
-    Enforces pre-upgrade validation before accepting the connection.
+    Enforces pre-upgrade validation, registers active socket locally,
+    and synchronizes connection state with Redis.
     """
     # 1. Pre-Accept Authentication Gate
     is_authenticated = await authenticate_agent_handshake(agent_id, token)
@@ -60,13 +61,13 @@ async def agent_websocket_endpoint(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    # 2. Upgrade Protocol & Register Active Connection
+    # 2. Upgrade Protocol & Register Active Connection (Local + Redis Sync)
     await ws_manager.connect(agent_id, websocket)
 
-    # 3. Message Loop & State Maintenance
+    # 3. Message Loop & Persistent Telemetry Channel
     try:
         while True:
-            # Maintain persistent read channel for incoming telemetry/acknowledgments
+            # Persistent non-blocking read frame loop
             message = await websocket.receive_text()
             logger.debug("Received payload from Agent [%s]: %s", agent_id, message)
     except WebSocketDisconnect:
@@ -74,5 +75,5 @@ async def agent_websocket_endpoint(
     except Exception as exc:
         logger.error("Unexpected socket error on Agent [%s]: %s", agent_id, exc)
     finally:
-        # 4. Mandatory cleanup to prevent memory/socket leaks
-        ws_manager.disconnect(agent_id)
+        # 4. Mandatory Async Cleanup: Evicts local socket and purges Redis state
+        await ws_manager.disconnect(agent_id)

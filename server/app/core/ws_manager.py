@@ -3,68 +3,75 @@ from typing import Dict
 from uuid import UUID
 
 from fastapi import WebSocket
+import redis.asyncio as redis
 
 logger = logging.getLogger("rmm.websocket")
 
 
 class ConnectionManager:
     """
-    Manages active, authenticated full-duplex WebSocket connections
-    for monitored endpoint agents.
+    Manages active WebSocket connections locally and syncs
+    ephemeral agent status to a global Redis datastore.
     """
 
     def __init__(self) -> None:
         self.active_connections: Dict[UUID, WebSocket] = {}
+        self.redis_client = redis.Redis(
+            host="127.0.0.1",
+            port=6379,
+            decode_responses=True,
+        )
 
     async def connect(self, agent_id: UUID, websocket: WebSocket) -> None:
         """
-        Accepts the pending WebSocket handshake upgrade and registers
-        the active socket mapped to the agent's unique identifier.
+        Accepts the socket, stores it locally, and publishes the online
+        status to Redis with a 60-second TTL (Time-To-Live).
         """
         await websocket.accept()
         self.active_connections[agent_id] = websocket
+
+        # Modern syntax: set key with expiration via ex argument
+        redis_key = f"agent:{agent_id}:status"
+        await self.redis_client.set(name=redis_key, value="online", ex=60)
+
         logger.info(
-            "Agent [%s] WebSocket tunnel established. Active nodes: %d",
+            "Agent [%s] WebSocket established & synced to Redis. Active local nodes: %d",
             agent_id,
             len(self.active_connections),
         )
 
-    def disconnect(self, agent_id: UUID) -> None:
+    async def disconnect(self, agent_id: UUID) -> None:
         """
-        Unregisters an agent's socket from active memory tracking upon
-        connection drop or explicit socket termination.
+        Removes the socket from local memory and immediately purges
+        the online status key from Redis.
         """
         if agent_id in self.active_connections:
             del self.active_connections[agent_id]
-            logger.info(
-                "Agent [%s] WebSocket disconnected. Active nodes: %d",
-                agent_id,
-                len(self.active_connections),
-            )
+
+        redis_key = f"agent:{agent_id}:status"
+        await self.redis_client.delete(redis_key)
+
+        logger.info(
+            "Agent [%s] WebSocket disconnected & removed from Redis. Active local nodes: %d",
+            agent_id,
+            len(self.active_connections),
+        )
 
     async def send_json(self, agent_id: UUID, payload: dict) -> bool:
         """
-        Dispatches a structured JSON payload directly to the target agent.
-        Returns True if delivered, False if the target is offline.
+        Dispatches JSON to a locally connected agent.
         """
         websocket = self.active_connections.get(agent_id)
         if not websocket:
-            logger.warning(
-                "Failed to send JSON: Agent [%s] is offline.",
-                agent_id,
-            )
+            logger.warning("Local dispatch failed: Agent [%s] socket not in memory.", agent_id)
             return False
 
         try:
             await websocket.send_json(payload)
             return True
         except Exception as exc:
-            logger.error(
-                "Error dispatching JSON to agent [%s]: %s",
-                agent_id,
-                exc,
-            )
-            self.disconnect(agent_id)
+            logger.error("Error dispatching JSON to agent [%s]: %s", agent_id, exc)
+            await self.disconnect(agent_id)
             return False
 
 
