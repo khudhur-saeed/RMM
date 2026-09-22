@@ -30,7 +30,6 @@ class ConnectionManager:
         await websocket.accept()
         self.active_connections[agent_id] = websocket
 
-        # Modern syntax: set key with expiration via ex argument
         redis_key = f"agent:{agent_id}:status"
         await self.redis_client.set(name=redis_key, value="online", ex=60)
 
