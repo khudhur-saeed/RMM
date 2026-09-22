@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"log"
 	"os"
@@ -14,6 +15,13 @@ import (
 	"tactical-rmm/agent/internal/system"
 	"tactical-rmm/agent/internal/ws"
 )
+
+// HeartbeatFrame defines the structured telemetry packet transmitted over the WebSocket tunnel
+type HeartbeatFrame struct {
+	Type      string `json:"type"`
+	AgentID   string `json:"agent_id"`
+	Timestamp int64  `json:"timestamp"`
+}
 
 func main() {
 	var (
@@ -36,7 +44,6 @@ func main() {
 	// 2. Check for Existing Configuration (Daemon Mode vs Enrollment Mode)
 	agentCfg, err := config.LoadConfig(configPath)
 	if err != nil {
-		// Enrollment Mode: Missing local state
 		if serverURL == "" || token == "" {
 			log.Fatalf("[-] Configuration not found at %s. To enroll, both -server and -token are required.", configPath)
 		}
@@ -73,7 +80,7 @@ func main() {
 
 	log.Printf("[*] Starting Tactical RMM Agent Daemon for Agent ID [%s]...", agentCfg.AgentID)
 
-	// 3. Initialize and Start Secure WebSocket Tunnel
+	// 3. Initialize and Start Secure WebSocket Tunnel with Decoupled Routines
 	wsConfig := ws.Config{
 		ServerURL:  agentCfg.ServerURL,
 		AgentID:    agentCfg.AgentID,
@@ -86,27 +93,43 @@ func main() {
 		log.Fatalf("[-] Failed to initialize WebSocket client: %v", err)
 	}
 
-	// Launch WebSocket tunnel worker asynchronously
+	// Launch WebSocket tunnel worker asynchronously (Reader & Writer loops)
 	go wsClient.Run(ctx)
 
-	// 4. Run Heartbeat Loop and Block Until Termination Signal
-	runHeartbeatLoop(ctx, agentCfg)
+	// 4. Run Heartbeat Loop Connected to WebSocket Outbound Channel
+	runHeartbeatLoop(ctx, agentCfg, wsClient)
 
 	log.Println("[*] Tactical RMM Agent shut down gracefully.")
 }
 
-// runHeartbeatLoop simulates periodic keep-alive telemetry dispatch
-func runHeartbeatLoop(ctx context.Context, cfg *config.AgentConfig) {
+// runHeartbeatLoop dispatches periodic keep-alive telemetry into the WebSocket outbound queue
+func runHeartbeatLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("[Heartbeat] Shutdown received. Stopping heartbeat loop.")
+			log.Println("[*] [Heartbeat] Context cancelled. Terminating heartbeat loop.")
 			return
 		case <-ticker.C:
-			log.Printf("[Heartbeat] Dispatching keep-alive for Agent [%s]...", cfg.AgentID)
+			frame := HeartbeatFrame{
+				Type:      "heartbeat",
+				AgentID:   cfg.AgentID,
+				Timestamp: time.Now().Unix(),
+			}
+
+			payload, err := json.Marshal(frame)
+			if err != nil {
+				log.Printf("[-] [Heartbeat] Failed to serialize heartbeat JSON: %v", err)
+				continue
+			}
+
+			if queued := wsClient.Send(payload); queued {
+				log.Printf("[+] [Heartbeat] Queued keep-alive frame for Agent [%s] (%d bytes)", cfg.AgentID, len(payload))
+			} else {
+				log.Printf("[-] [Heartbeat] Outbound buffer saturated; dropped frame for Agent [%s]", cfg.AgentID)
+			}
 		}
 	}
 }

@@ -22,13 +22,14 @@ type Config struct {
 	CACertPath string
 }
 
-// Client represents the resilient Go WebSocket management client
+// Client represents the resilient Go WebSocket management client with decoupled I/O
 type Client struct {
-	cfg    Config
-	dialer *websocket.Dialer
+	cfg          Config
+	dialer       *websocket.Dialer
+	outboundChan chan []byte
 }
 
-// NewClient initializes the WebSocket client enforcing TLS 1.3 and custom Root CA validation
+// NewClient initializes the WebSocket client enforcing TLS 1.3, custom Root CA, and channel allocation
 func NewClient(cfg Config) (*Client, error) {
 	tlsConfig := &tls.Config{
 		MinVersion: tls.VersionTLS13,
@@ -53,9 +54,21 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 
 	return &Client{
-		cfg:    cfg,
-		dialer: dialer,
+		cfg:          cfg,
+		dialer:       dialer,
+		outboundChan: make(chan []byte, 64),
 	}, nil
+}
+
+// Send queues a payload into the thread-safe outbound channel without blocking on network I/O
+func (c *Client) Send(data []byte) bool {
+	select {
+	case c.outboundChan <- data:
+		return true
+	default:
+		log.Println("[-] [WS] Outbound channel full! Dropping packet to prevent agent freeze.")
+		return false
+	}
 }
 
 // buildWebSocketURL converts http(s) into ws(s) and appends handshake credentials
@@ -92,18 +105,18 @@ func (c *Client) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("[WS] Context cancelled. Exiting WebSocket worker.")
+			log.Println("[*] [WS] Context cancelled. Exiting WebSocket worker.")
 			return
 		default:
 		}
 
 		wsURL, err := c.buildWebSocketURL()
 		if err != nil {
-			log.Printf("[WS] URL build error: %v", err)
+			log.Printf("[-] [WS] URL build error: %v", err)
 			return
 		}
 
-		log.Printf("[WS] Attempting secure C2 handshake: %s/api/v1/ws/agent/%s?token=***",
+		log.Printf("[*] [WS] Attempting secure C2 handshake: %s/api/v1/ws/agent/%s?token=***",
 			strings.Split(wsURL, "/api/v1")[0], c.cfg.AgentID)
 
 		conn, resp, err := c.dialer.DialContext(ctx, wsURL, nil)
@@ -112,7 +125,7 @@ func (c *Client) Run(ctx context.Context) {
 			if resp != nil {
 				statusCode = resp.StatusCode
 			}
-			log.Printf("[WS] Connection failed (HTTP Status: %d): %v. Retrying in %v...", statusCode, err, backoff)
+			log.Printf("[-] [WS] Connection failed (HTTP Status: %d): %v. Retrying in %v...", statusCode, err, backoff)
 
 			select {
 			case <-time.After(backoff):
@@ -128,41 +141,53 @@ func (c *Client) Run(ctx context.Context) {
 
 		// Reset backoff on successful handshake
 		backoff = 2 * time.Second
-		log.Printf("[WS] Secure full-duplex tunnel established with control plane.")
+		log.Printf("[+] [WS] Secure full-duplex tunnel established with control plane.")
 
 		c.handleConnection(ctx, conn)
 	}
 }
 
-// handleConnection manages frame reads and clean disconnection
+// handleConnection orchestrates concurrent reader and writer routines
 func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 	defer conn.Close()
 
-	// Channel to signal read loop termination
-	closed := make(chan struct{})
+	// Internal context to terminate writer when reader fails or vice versa
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	defer cancelSession()
 
+	// 1. Dedicated Outgoing Writer Goroutine
 	go func() {
 		for {
-			messageType, payload, err := conn.ReadMessage()
-			if err != nil {
-				log.Printf("[WS] Read error / socket disconnected: %v", err)
-				close(closed)
+			select {
+			case <-sessionCtx.Done():
 				return
+			case msg, ok := <-c.outboundChan:
+				if !ok {
+					return
+				}
+				if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+					log.Printf("[-] [WS] Socket write error: %v", err)
+					cancelSession()
+					return
+				}
 			}
-			log.Printf("[WS] Received frame (Type %d, Bytes %d): %s", messageType, len(payload), string(payload))
 		}
 	}()
 
-	select {
-	case <-ctx.Done():
-		log.Println("[WS] Terminating socket connection gracefully...")
-		closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Agent shutting down")
-		_ = conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(2*time.Second))
-		select {
-		case <-closed:
-		case <-time.After(1 * time.Second):
+	// 2. Dedicated Inbound Reader Loop (Blocks current routine safely)
+	for {
+		messageType, payload, err := conn.ReadMessage()
+		if err != nil {
+			log.Printf("[-] [WS] Socket read error / disconnected: %v", err)
+			cancelSession()
+			break
 		}
-	case <-closed:
-		log.Println("[WS] Socket closed by remote peer or network drop.")
+
+		log.Printf("[+] [WS] Inbound Frame (Type %d, Bytes %d): %s", messageType, len(payload), string(payload))
+		// Inbound commands will be dispatched to execution workers here
 	}
+
+	// 3. Graceful Close Handshake
+	closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Agent socket recycling")
+	_ = conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(1*time.Second))
 }
