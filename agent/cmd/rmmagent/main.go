@@ -16,11 +16,12 @@ import (
 	"tactical-rmm/agent/internal/ws"
 )
 
-// HeartbeatFrame defines the structured telemetry packet transmitted over the WebSocket tunnel
-type HeartbeatFrame struct {
-	Type      string `json:"type"`
-	AgentID   string `json:"agent_id"`
-	Timestamp int64  `json:"timestamp"`
+// HeartbeatBeaconFrame models the telemetry keep-alive payload dispatched upstream
+type HeartbeatBeaconFrame struct {
+	Type      string                   `json:"type"`
+	AgentID   string                   `json:"agent_id"`
+	Timestamp int64                    `json:"timestamp"`
+	Telemetry system.TelemetrySnapshot `json:"telemetry"`
 }
 
 func main() {
@@ -80,7 +81,7 @@ func main() {
 
 	log.Printf("[*] Starting Tactical RMM Agent Daemon for Agent ID [%s]...", agentCfg.AgentID)
 
-	// 3. Initialize and Start Secure WebSocket Tunnel with Decoupled Routines
+	// 3. Initialize and Start Secure WebSocket Tunnel with Pong Handling
 	wsConfig := ws.Config{
 		ServerURL:  agentCfg.ServerURL,
 		AgentID:    agentCfg.AgentID,
@@ -93,16 +94,16 @@ func main() {
 		log.Fatalf("[-] Failed to initialize WebSocket client: %v", err)
 	}
 
-	// Launch WebSocket tunnel worker asynchronously (Reader & Writer loops)
+	// Launch WebSocket tunnel worker asynchronously
 	go wsClient.Run(ctx)
 
-	// 4. Run Heartbeat Loop Connected to WebSocket Outbound Channel
+	// 4. Run Heartbeat Loop Packaging Telemetry Snapshot
 	runHeartbeatLoop(ctx, agentCfg, wsClient)
 
 	log.Println("[*] Tactical RMM Agent shut down gracefully.")
 }
 
-// runHeartbeatLoop dispatches periodic keep-alive telemetry into the WebSocket outbound queue
+// runHeartbeatLoop gathers snapshots and sends structured telemetry beacon frames every 30 seconds
 func runHeartbeatLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -113,22 +114,30 @@ func runHeartbeatLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws
 			log.Println("[*] [Heartbeat] Context cancelled. Terminating heartbeat loop.")
 			return
 		case <-ticker.C:
-			frame := HeartbeatFrame{
+			// Capture instantaneous OS and runtime metrics
+			telemetry, err := system.CollectTelemetry()
+			if err != nil {
+				log.Printf("[-] [Heartbeat] Telemetry collection warning: %v", err)
+			}
+
+			frame := HeartbeatBeaconFrame{
 				Type:      "heartbeat",
 				AgentID:   cfg.AgentID,
 				Timestamp: time.Now().Unix(),
+				Telemetry: telemetry,
 			}
 
 			payload, err := json.Marshal(frame)
 			if err != nil {
-				log.Printf("[-] [Heartbeat] Failed to serialize heartbeat JSON: %v", err)
+				log.Printf("[-] [Heartbeat] Failed to serialize beacon JSON: %v", err)
 				continue
 			}
 
 			if queued := wsClient.Send(payload); queued {
-				log.Printf("[+] [Heartbeat] Queued keep-alive frame for Agent [%s] (%d bytes)", cfg.AgentID, len(payload))
+				log.Printf("[+] [Heartbeat] Telemetry beacon queued (Mem: %dMB, Goroutines: %d, Uptime: %ds, Payload: %d bytes)",
+					telemetry.MemoryAllocMB, telemetry.NumGoroutine, telemetry.UptimeSeconds, len(payload))
 			} else {
-				log.Printf("[-] [Heartbeat] Outbound buffer saturated; dropped frame for Agent [%s]", cfg.AgentID)
+				log.Printf("[-] [Heartbeat] Outbound buffer saturated; dropped telemetry frame for Agent [%s]", cfg.AgentID)
 			}
 		}
 	}
