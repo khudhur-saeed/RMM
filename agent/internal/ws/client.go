@@ -4,29 +4,29 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"math/rand/v2"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
+
+	agentExec "tactical-rmm/agent/internal/exec"
 
 	"github.com/gorilla/websocket"
 )
 
 const (
-	// pongWait is the maximum time to wait for the next pong from the peer
-	pongWait = 60 * time.Second
-
-	// baseBackoff defines the baseline initial retry duration
-	baseBackoff = 1 * time.Second
-
-	// maxBackoff defines the upper bound limit for exponential backoff
-	maxBackoff = 60 * time.Second
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = (pongWait * 9) / 10
+	maxMessageSize = 512 * 1024 // 512 KB
+	defaultTimeout = 30 * time.Second
 )
 
-// Config encapsulates parameters required to establish a secure C2 tunnel
 type Config struct {
 	ServerURL  string
 	AgentID    string
@@ -34,14 +34,31 @@ type Config struct {
 	CACertPath string
 }
 
-// Client represents the resilient Go WebSocket management client with decoupled I/O
-type Client struct {
-	cfg          Config
-	dialer       *websocket.Dialer
-	outboundChan chan []byte
+type CommandPayload struct {
+	Type      string `json:"type"`
+	CommandID string `json:"cmd_id"`
+	Command   string `json:"command"`
 }
 
-// NewClient initializes the WebSocket client enforcing TLS 1.3, custom Root CA, and channel allocation
+type CommandResponseFrame struct {
+	Type            string `json:"type"`
+	CommandID       string `json:"cmd_id"`
+	Stdout          string `json:"stdout"`
+	Stderr          string `json:"stderr"`
+	ExitCode        int    `json:"exit_code"`
+	ExecutionTimeMs int64  `json:"execution_time_ms"`
+	Error           string `json:"error,omitempty"`
+}
+
+type Client struct {
+	config       Config
+	dialer       websocket.Dialer
+	outboundChan chan []byte
+	executor     agentExec.CommandExecutor
+	mu           sync.Mutex
+	isConnected  bool
+}
+
 func NewClient(cfg Config) (*Client, error) {
 	tlsConfig := &tls.Config{
 		MinVersion: tls.VersionTLS13,
@@ -50,192 +67,233 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.CACertPath != "" {
 		caCert, err := os.ReadFile(cfg.CACertPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read CA certificate for websocket: %w", err)
+			return nil, fmt.Errorf("failed to read custom Root CA certificate: %w", err)
 		}
 
-		rootPool := x509.NewCertPool()
-		if !rootPool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("failed to parse valid PEM from CA certificate")
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, errors.New("failed to append custom Root CA certificate to pool")
 		}
-		tlsConfig.RootCAs = rootPool
-	}
-
-	dialer := &websocket.Dialer{
-		TLSClientConfig:  tlsConfig,
-		HandshakeTimeout: 15 * time.Second,
+		tlsConfig.RootCAs = caCertPool
 	}
 
 	return &Client{
-		cfg:          cfg,
-		dialer:       dialer,
+		config: cfg,
+		dialer: websocket.Dialer{
+			TLSClientConfig:  tlsConfig,
+			HandshakeTimeout: 15 * time.Second,
+		},
 		outboundChan: make(chan []byte, 64),
+		executor:     agentExec.NewExecutor(),
 	}, nil
 }
 
-// Send queues a payload into the thread-safe outbound channel without blocking on network I/O
-func (c *Client) Send(data []byte) bool {
+func (c *Client) buildWebSocketURL() (string, error) {
+	parsed, err := url.Parse(c.config.ServerURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid server URL: %w", err)
+	}
+
+	scheme := "ws"
+	if parsed.Scheme == "https" {
+		scheme = "wss"
+	}
+
+	wsURL := fmt.Sprintf("%s://%s/api/v1/ws/agent/%s?token=%s",
+		scheme,
+		parsed.Host,
+		c.config.AgentID,
+		c.config.APIKey,
+	)
+
+	return wsURL, nil
+}
+
+func (c *Client) Send(payload []byte) bool {
 	select {
-	case c.outboundChan <- data:
+	case c.outboundChan <- payload:
 		return true
 	default:
-		log.Println("[-] [WS] Outbound channel full! Dropping packet to prevent agent freeze.")
 		return false
 	}
 }
 
-// buildWebSocketURL converts http(s) into ws(s) and appends handshake credentials
-func (c *Client) buildWebSocketURL() (string, error) {
-	parsed, err := url.Parse(c.cfg.ServerURL)
-	if err != nil {
-		return "", fmt.Errorf("invalid server url: %w", err)
-	}
-
-	scheme := "wss"
-	if parsed.Scheme == "http" {
-		scheme = "ws"
-	}
-
-	wsPath := fmt.Sprintf("%s/api/v1/ws/agent/%s", strings.TrimRight(parsed.Path, "/"), c.cfg.AgentID)
-	q := url.Values{}
-	q.Set("token", c.cfg.APIKey)
-
-	u := url.URL{
-		Scheme:   scheme,
-		Host:     parsed.Host,
-		Path:     wsPath,
-		RawQuery: q.Encode(),
-	}
-
-	return u.String(), nil
-}
-
-// computeBackoff calculates bounded exponential backoff with decorrelated jitter
-func computeBackoff(attempt int, base time.Duration, maxCap time.Duration) time.Duration {
-	if attempt < 0 {
-		attempt = 0
-	}
-
-	// Protect against bit shift overflow (limit to 30 shifts)
-	if attempt > 30 {
-		attempt = 30
-	}
-
-	// Calculate exponential interval: base * 2^attempt
-	multiplier := 1 << attempt
-	calculatedInterval := base * time.Duration(multiplier)
-
-	// Clamp to maximum allowed duration
-	if calculatedInterval > maxCap || calculatedInterval <= 0 {
-		calculatedInterval = maxCap
-	}
-
-	// Apply balanced jitter: 50% deterministic floor + 50% uniform randomness
-	halfInterval := calculatedInterval / 2
-	if halfInterval <= 0 {
-		return calculatedInterval
-	}
-
-	jitter := time.Duration(rand.Int64N(int64(halfInterval)))
-	return halfInterval + jitter
-}
-
-// Run starts the persistent full-duplex tunnel with exponential backoff and jitter
 func (c *Client) Run(ctx context.Context) {
-	retryAttempt := 0
+	baseBackoff := 1 * time.Second
+	maxBackoff := 60 * time.Second
+	currentBackoff := baseBackoff
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("[*] [WS] Context cancelled. Exiting WebSocket worker.")
+			log.Println("[*] [WS] Termination signal received. Halting client loop.")
 			return
 		default:
 		}
 
 		wsURL, err := c.buildWebSocketURL()
 		if err != nil {
-			log.Printf("[-] [WS] URL build error: %v", err)
+			log.Printf("[-] [WS] Configuration error: %v", err)
 			return
 		}
 
-		log.Printf("[*] [WS] Attempting secure C2 handshake (Attempt %d): %s/api/v1/ws/agent/%s?token=***",
-			retryAttempt+1, strings.Split(wsURL, "/api/v1")[0], c.cfg.AgentID)
-
+		log.Printf("[*] [WS] Attempting secure C2 handshake: %s", sanitizeLogURL(wsURL))
 		conn, resp, err := c.dialer.DialContext(ctx, wsURL, nil)
 		if err != nil {
 			statusCode := 0
 			if resp != nil {
 				statusCode = resp.StatusCode
 			}
-
-			sleepDuration := computeBackoff(retryAttempt, baseBackoff, maxBackoff)
-			log.Printf("[-] [WS] Connection failed (HTTP Status: %d): %v. Retrying in %v (Backoff + Jitter)...",
-				statusCode, err, sleepDuration)
-
-			retryAttempt++
+			log.Printf("[-] [WS] Connection failed (HTTP Status: %d): %v. Retrying in %v...", statusCode, err, currentBackoff)
 
 			select {
-			case <-time.After(sleepDuration):
+			case <-time.After(currentBackoff):
+				currentBackoff *= 2
+				if currentBackoff > maxBackoff {
+					currentBackoff = maxBackoff
+				}
 				continue
 			case <-ctx.Done():
 				return
 			}
 		}
 
-		// Reset retry counter upon successful full-duplex handshake
-		retryAttempt = 0
-		log.Printf("[+] [WS] Secure full-duplex tunnel established with control plane.")
+		currentBackoff = baseBackoff
+		c.setConnected(true)
+		log.Println("[+] [WS] Secure full-duplex tunnel established with control plane.")
 
-		c.handleConnection(ctx, conn)
+		sessionCtx, cancelSession := context.WithCancel(ctx)
+		var sessionWg sync.WaitGroup
+
+		sessionWg.Add(1)
+		go func() {
+			defer sessionWg.Done()
+			c.writePump(sessionCtx, conn)
+		}()
+
+		c.readPump(sessionCtx, conn)
+
+		cancelSession()
+		conn.Close()
+		sessionWg.Wait()
+
+		c.setConnected(false)
+		log.Println("[-] [WS] Session disconnected. Entering reconnect routine.")
 	}
 }
 
-// handleConnection orchestrates concurrent reader, writer routines, and pong handling
-func (c *Client) handleConnection(ctx context.Context, conn *websocket.Conn) {
-	defer conn.Close()
+func (c *Client) writePump(ctx context.Context, conn *websocket.Conn) {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
 
-	sessionCtx, cancelSession := context.WithCancel(ctx)
-	defer cancelSession()
+	for {
+		select {
+		case <-ctx.Done():
+			_ = conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Agent shutting down"),
+				time.Now().Add(writeWait),
+			)
+			return
+		case payload, ok := <-c.outboundChan:
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				_ = conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
 
-	// 1. Configure Pong Handler and Read Deadline
+			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+				log.Printf("[-] [WS] Socket write error: %v", err)
+				return
+			}
+		case <-ticker.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Printf("[-] [WS] Keep-alive ping failed: %v", err)
+				return
+			}
+		}
+	}
+}
+
+func (c *Client) readPump(ctx context.Context, conn *websocket.Conn) {
+	conn.SetReadLimit(maxMessageSize)
 	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
-	conn.SetPongHandler(func(appData string) error {
+	conn.SetPongHandler(func(string) error {
 		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
-		log.Printf("[+] [WS] Pong received from server (Data: %s)", appData)
 		return nil
 	})
 
-	// 2. Dedicated Outgoing Writer Goroutine
-	go func() {
-		for {
-			select {
-			case <-sessionCtx.Done():
-				return
-			case msg, ok := <-c.outboundChan:
-				if !ok {
-					return
-				}
-				if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-					log.Printf("[-] [WS] Socket write error: %v", err)
-					cancelSession()
-					return
-				}
-			}
-		}
-	}()
-
-	// 3. Dedicated Inbound Reader Loop (Blocks safely on socket)
 	for {
-		messageType, payload, err := conn.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("[-] [WS] Socket read error / keep-alive timeout: %v", err)
-			cancelSession()
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("[-] [WS] Unexpected socket closure: %v", err)
+			}
 			break
 		}
 
-		log.Printf("[+] [WS] Inbound Frame (Type %d, Bytes %d): %s", messageType, len(payload), string(payload))
+		// Detect and parse command execution requests
+		var cmd CommandPayload
+		if err := json.Unmarshal(message, &cmd); err == nil && cmd.Type == "exec_cmd" {
+			log.Printf("[+] [WS] Received remote command [%s]: %s", cmd.CommandID, cmd.Command)
+			go c.handleCommandExecution(ctx, cmd)
+			continue
+		}
+
+		log.Printf("[*] [WS] Unhandled message payload: %s", string(message))
+	}
+}
+
+func (c *Client) handleCommandExecution(ctx context.Context, cmd CommandPayload) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[-] [Panic] Command execution worker recovered: %v", r)
+		}
+	}()
+
+	cmdCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
+	defer cancel()
+
+	result, err := c.executor.Execute(cmdCtx, cmd.Command)
+
+	response := CommandResponseFrame{
+		Type:            "command_result",
+		CommandID:       cmd.CommandID,
+		Stdout:          result.Stdout,
+		Stderr:          result.Stderr,
+		ExitCode:        result.ExitCode,
+		ExecutionTimeMs: result.ExecutionTimeMs,
 	}
 
-	// 4. Graceful Close Handshake
-	closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Agent socket recycling")
-	_ = conn.WriteControl(websocket.CloseMessage, closeMsg, time.Now().Add(1*time.Second))
+	if err != nil {
+		response.Error = err.Error()
+	}
+
+	payload, encErr := json.Marshal(response)
+	if encErr != nil {
+		log.Printf("[-] [WS] Failed to encode command result frame: %v", encErr)
+		return
+	}
+
+	if !c.Send(payload) {
+		log.Printf("[-] [WS] Failed to queue result for command [%s]: outbound buffer full", cmd.CommandID)
+	} else {
+		log.Printf("[+] [WS] Queued execution result for command [%s] (Exit Code: %d, Time: %dms)",
+			cmd.CommandID, result.ExitCode, result.ExecutionTimeMs)
+	}
+}
+
+func (c *Client) setConnected(status bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.isConnected = status
+}
+
+func sanitizeLogURL(rawURL string) string {
+	idx := strings.Index(rawURL, "token=")
+	if idx == -1 {
+		return rawURL
+	}
+	return rawURL[:idx] + "token=***"
 }
