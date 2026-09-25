@@ -6,10 +6,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os/exec"
 	"syscall"
 	"time"
 )
+
+// maxStreamCaptureBytes limits individual stdout/stderr captures to 2MB to prevent memory exhaustion
+const maxStreamCaptureBytes int64 = 2 * 1024 * 1024
 
 // LinuxExecutor implements CommandExecutor for Linux/POSIX environments.
 type LinuxExecutor struct{}
@@ -19,26 +23,67 @@ func NewExecutor() CommandExecutor {
 	return &LinuxExecutor{}
 }
 
-// Execute spawns a shell process under /bin/sh with process group isolation.
+// resolveShell selects /bin/bash if available on the host, otherwise gracefully falls back to /bin/sh.
+func resolveShell() string {
+	if path, err := exec.LookPath("/bin/bash"); err == nil {
+		return path
+	}
+	return "/bin/sh"
+}
+
+// Execute runs a shell command with argument isolation, stream redirection, and resource bounding.
 func (e *LinuxExecutor) Execute(ctx context.Context, command string) (CommandResult, error) {
 	if command == "" {
 		return CommandResult{}, ErrEmptyCommand
 	}
 
+	shellPath := resolveShell()
 	startTime := time.Now()
 
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
+	// Argument isolation: invoke shell with -c followed explicitly by the command payload
+	cmd := exec.CommandContext(ctx, shellPath, "-c", command)
 
-	// Ensure process isolation via dedicated POSIX process group
+	// Enforce dedicated POSIX process group to eliminate orphaned child processes
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
 
-	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &stdoutBuf
-	cmd.Stderr = &stderrBuf
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return CommandResult{}, err
+	}
 
-	runErr := cmd.Run()
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return CommandResult{}, err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return CommandResult{}, err
+	}
+
+	// Capture streams concurrently with strict size boundaries
+	var stdoutBuf, stderrBuf bytes.Buffer
+	stdoutDone := make(chan error, 1)
+	stderrDone := make(chan error, 1)
+
+	go func() {
+		limitedReader := io.LimitReader(stdoutPipe, maxStreamCaptureBytes)
+		_, readErr := io.Copy(&stdoutBuf, limitedReader)
+		stdoutDone <- readErr
+	}()
+
+	go func() {
+		limitedReader := io.LimitReader(stderrPipe, maxStreamCaptureBytes)
+		_, readErr := io.Copy(&stderrBuf, limitedReader)
+		stderrDone <- readErr
+	}()
+
+	// Wait for stream drains to complete
+	_ = <-stdoutDone
+	_ = <-stderrDone
+
+	runErr := cmd.Wait()
 	elapsed := time.Since(startTime).Milliseconds()
 
 	result := CommandResult{
@@ -49,13 +94,11 @@ func (e *LinuxExecutor) Execute(ctx context.Context, command string) (CommandRes
 	}
 
 	if runErr != nil {
-		// Check if context deadline was exceeded
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			result.ExitCode = 124 // POSIX standard timeout exit code
 			return result, ErrExecutionTimedOut
 		}
 
-		// Extract concrete OS exit code if available
 		var exitErr *exec.ExitError
 		if errors.As(runErr, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
