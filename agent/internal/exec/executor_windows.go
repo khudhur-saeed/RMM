@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -27,15 +28,15 @@ func NewExecutor() CommandExecutor {
 }
 
 // buildCommand prepares the execution command using powershell.exe or cmd.exe
-func buildCommand(ctx context.Context, command string) *exec.Cmd {
+func buildCommand(command string) *exec.Cmd {
 	// If explicitly prefixed with cmd.exe, route via CMD, otherwise default to PowerShell
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(command)), "cmd /c ") {
 		rawCmd := strings.TrimSpace(command)[7:]
-		return exec.CommandContext(ctx, "cmd.exe", "/c", rawCmd)
+		return exec.Command("cmd.exe", "/c", rawCmd)
 	}
 
 	// Hardened PowerShell parameters: isolated profile, non-interactive, execution policy bypass
-	return exec.CommandContext(ctx, "powershell.exe",
+	return exec.Command("powershell.exe",
 		"-NoProfile",
 		"-NonInteractive",
 		"-ExecutionPolicy", "Bypass",
@@ -43,16 +44,25 @@ func buildCommand(ctx context.Context, command string) *exec.Cmd {
 	)
 }
 
-// Execute runs a PowerShell script or CMD directive suppressing console windows.
+// killProcessTreeWin terminates the target process and all child descendants recursively.
+func killProcessTreeWin(pid int) error {
+	killCmd := exec.Command("taskkill.exe", "/F", "/T", "/PID", strconv.Itoa(pid))
+	killCmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: windows.CREATE_NO_WINDOW,
+	}
+	return killCmd.Run()
+}
+
+// Execute runs a PowerShell script or CMD directive enforcing recursive tree termination on timeout.
 func (e *WindowsExecutor) Execute(ctx context.Context, command string) (CommandResult, error) {
 	if command == "" {
 		return CommandResult{}, ErrEmptyCommand
 	}
 
 	startTime := time.Now()
-	cmd := buildCommand(ctx, command)
+	cmd := buildCommand(command)
 
-	// Suppress visible console window allocation
+	// Suppress visible console window allocation in Session 0
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: windows.CREATE_NO_WINDOW,
 	}
@@ -70,6 +80,23 @@ func (e *WindowsExecutor) Execute(ctx context.Context, command string) (CommandR
 	if err := cmd.Start(); err != nil {
 		return CommandResult{}, err
 	}
+
+	// Goroutine dedicated to watching context cancellation and killing the entire process tree
+	killDone := make(chan struct{})
+	defer close(killDone)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Execute recursive tree termination via taskkill to prevent orphaned processes
+			if cmd.Process != nil {
+				_ = killProcessTreeWin(cmd.Process.Pid)
+			}
+		case <-killDone:
+			// Process completed normally prior to context cancellation
+			return
+		}
+	}()
 
 	// Capture streams concurrently with strict size boundaries
 	var stdoutBuf, stderrBuf bytes.Buffer

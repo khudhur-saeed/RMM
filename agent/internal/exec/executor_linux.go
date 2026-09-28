@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// maxStreamCaptureBytes limits individual stdout/stderr captures to 2MB to prevent memory exhaustion
+// maxStreamCaptureBytes limits individual stdout/stderr captures to 2MB
 const maxStreamCaptureBytes int64 = 2 * 1024 * 1024
 
 // LinuxExecutor implements CommandExecutor for Linux/POSIX environments.
@@ -23,7 +23,7 @@ func NewExecutor() CommandExecutor {
 	return &LinuxExecutor{}
 }
 
-// resolveShell selects /bin/bash if available on the host, otherwise gracefully falls back to /bin/sh.
+// resolveShell selects /bin/bash if available, otherwise gracefully falls back to /bin/sh.
 func resolveShell() string {
 	if path, err := exec.LookPath("/bin/bash"); err == nil {
 		return path
@@ -31,7 +31,7 @@ func resolveShell() string {
 	return "/bin/sh"
 }
 
-// Execute runs a shell command with argument isolation, stream redirection, and resource bounding.
+// Execute runs a command enforcing process tree termination upon context cancellation.
 func (e *LinuxExecutor) Execute(ctx context.Context, command string) (CommandResult, error) {
 	if command == "" {
 		return CommandResult{}, ErrEmptyCommand
@@ -40,10 +40,10 @@ func (e *LinuxExecutor) Execute(ctx context.Context, command string) (CommandRes
 	shellPath := resolveShell()
 	startTime := time.Now()
 
-	// Argument isolation: invoke shell with -c followed explicitly by the command payload
-	cmd := exec.CommandContext(ctx, shellPath, "-c", command)
+	// Initialize command without implicit signal binding to control process group signaling
+	cmd := exec.Command(shellPath, "-c", command)
 
-	// Enforce dedicated POSIX process group to eliminate orphaned child processes
+	// Allocate a new POSIX process group (PGID == PID of parent process)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
@@ -62,24 +62,41 @@ func (e *LinuxExecutor) Execute(ctx context.Context, command string) (CommandRes
 		return CommandResult{}, err
 	}
 
-	// Capture streams concurrently with strict size boundaries
+	// Goroutine dedicated to watching context cancellation and killing the entire process group
+	killDone := make(chan struct{})
+	defer close(killDone)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			// Send SIGKILL to negative PGID (-pid) to terminate root and all child descendants
+			if cmd.Process != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+		case <-killDone:
+			// Process finished normally before context cancellation
+			return
+		}
+	}()
+
+	// Capture streams concurrently with strict 2MB bounds
 	var stdoutBuf, stderrBuf bytes.Buffer
 	stdoutDone := make(chan error, 1)
 	stderrDone := make(chan error, 1)
 
 	go func() {
-		limitedReader := io.LimitReader(stdoutPipe, maxStreamCaptureBytes)
-		_, readErr := io.Copy(&stdoutBuf, limitedReader)
-		stdoutDone <- readErr
+		limited := io.LimitReader(stdoutPipe, maxStreamCaptureBytes)
+		_, rErr := io.Copy(&stdoutBuf, limited)
+		stdoutDone <- rErr
 	}()
 
 	go func() {
-		limitedReader := io.LimitReader(stderrPipe, maxStreamCaptureBytes)
-		_, readErr := io.Copy(&stderrBuf, limitedReader)
-		stderrDone <- readErr
+		limited := io.LimitReader(stderrPipe, maxStreamCaptureBytes)
+		_, rErr := io.Copy(&stderrBuf, limited)
+		stderrDone <- rErr
 	}()
 
-	// Wait for stream drains to complete
+	// Drain output streams
 	_ = <-stdoutDone
 	_ = <-stderrDone
 
@@ -95,7 +112,7 @@ func (e *LinuxExecutor) Execute(ctx context.Context, command string) (CommandRes
 
 	if runErr != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			result.ExitCode = 124 // POSIX standard timeout exit code
+			result.ExitCode = 124 // POSIX timeout exit code
 			return result, ErrExecutionTimedOut
 		}
 

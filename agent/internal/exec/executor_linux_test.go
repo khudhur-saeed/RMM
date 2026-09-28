@@ -5,6 +5,8 @@ package exec
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -55,7 +57,6 @@ func TestLinuxExecutor_ExecutionPipeline(t *testing.T) {
 	})
 
 	t.Run("VerifyContextDeadlineExceeded", func(t *testing.T) {
-		// Short timeout to force abortion
 		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 		defer cancel()
 
@@ -68,6 +69,35 @@ func TestLinuxExecutor_ExecutionPipeline(t *testing.T) {
 
 		if res.ExitCode != 124 {
 			t.Errorf("expected exit code 124 for POSIX timeout, got %d", res.ExitCode)
+		}
+	})
+
+	t.Run("VerifyProcessTreeTermination", func(t *testing.T) {
+		// Unique marker to prevent collisions with other system processes
+		uniqueMarker := fmt.Sprintf("rmm_leak_marker_%d", time.Now().UnixNano())
+
+		// Strict execution budget: 200ms
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+
+		// Command spawns an asynchronous child process in the background (&) and sleeps
+		cmd := fmt.Sprintf("sh -c 'sleep 30 # %s' & sleep 30", uniqueMarker)
+		_, err := executor.Execute(ctx, cmd)
+
+		if !errors.Is(err, ErrExecutionTimedOut) {
+			t.Fatalf("expected ErrExecutionTimedOut, got: %v", err)
+		}
+
+		// Grace window to let OS kernel clean up terminated process table
+		time.Sleep(100 * time.Millisecond)
+
+		// Assert zero orphaned child processes exist matching the unique marker
+		checkCmd := exec.Command("pgrep", "-f", uniqueMarker)
+		out, pgrepErr := checkCmd.CombinedOutput()
+
+		// In pgrep: exit code 1 means no matching processes were found (Success state)
+		if pgrepErr == nil {
+			t.Fatalf("process tree termination failed: orphaned process leaked! Found PID(s):\n%s", string(out))
 		}
 	})
 }
