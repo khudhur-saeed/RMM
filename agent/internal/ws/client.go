@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	agentExec "tactical-rmm/agent/internal/exec"
-
 	"github.com/gorilla/websocket"
+
+	agentExec "tactical-rmm/agent/internal/exec"
 )
 
 const (
@@ -34,31 +34,16 @@ type Config struct {
 	CACertPath string
 }
 
-type CommandPayload struct {
-	Type      string `json:"type"`
-	CommandID string `json:"cmd_id"`
-	Command   string `json:"command"`
-}
-
-type CommandResponseFrame struct {
-	Type            string `json:"type"`
-	CommandID       string `json:"cmd_id"`
-	Stdout          string `json:"stdout"`
-	Stderr          string `json:"stderr"`
-	ExitCode        int    `json:"exit_code"`
-	ExecutionTimeMs int64  `json:"execution_time_ms"`
-	Error           string `json:"error,omitempty"`
-}
-
+// Client encapsulates the full-duplex WebSocket connection lifecycle.
 type Client struct {
 	config       Config
 	dialer       websocket.Dialer
 	outboundChan chan []byte
-	executor     agentExec.CommandExecutor
 	mu           sync.Mutex
 	isConnected  bool
 }
 
+// NewClient initializes the WebSocket client enforcing TLS 1.3 and Root CA verification.
 func NewClient(cfg Config) (*Client, error) {
 	tlsConfig := &tls.Config{
 		MinVersion: tls.VersionTLS13,
@@ -84,7 +69,6 @@ func NewClient(cfg Config) (*Client, error) {
 			HandshakeTimeout: 15 * time.Second,
 		},
 		outboundChan: make(chan []byte, 64),
-		executor:     agentExec.NewExecutor(),
 	}, nil
 }
 
@@ -109,17 +93,20 @@ func (c *Client) buildWebSocketURL() (string, error) {
 	return wsURL, nil
 }
 
+// Send queues a payload onto the outbound channel without blocking the caller.
 func (c *Client) Send(payload []byte) bool {
 	select {
 	case c.outboundChan <- payload:
 		return true
 	default:
+		log.Println("[-] [WS] Outbound buffer saturated; frame dropped")
 		return false
 	}
 }
 
+// Run executes the resilient connection loop with exponential backoff.
 func (c *Client) Run(ctx context.Context) {
-	baseBackoff := 1 * time.Second
+	baseBackoff := 2 * time.Second
 	maxBackoff := 60 * time.Second
 	currentBackoff := baseBackoff
 
@@ -233,55 +220,76 @@ func (c *Client) readPump(ctx context.Context, conn *websocket.Conn) {
 			break
 		}
 
-		// Detect and parse command execution requests
-		var cmd CommandPayload
-		if err := json.Unmarshal(message, &cmd); err == nil && cmd.Type == "exec_cmd" {
-			log.Printf("[+] [WS] Received remote command [%s]: %s", cmd.CommandID, cmd.Command)
-			go c.handleCommandExecution(ctx, cmd)
+		// Inspect inbound frame type
+		var genericFrame struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(message, &genericFrame); err != nil {
 			continue
 		}
 
-		log.Printf("[*] [WS] Unhandled message payload: %s", string(message))
+		switch genericFrame.Type {
+		case "task_dispatch":
+			var dispatchFrame TaskDispatchFrame
+			if err := json.Unmarshal(message, &dispatchFrame); err == nil && dispatchFrame.Command != "" {
+				log.Printf("[+] [Task] Inbound task dispatch [%s]: %s", dispatchFrame.TaskID, dispatchFrame.Command)
+				go c.handleTaskDispatch(dispatchFrame)
+			}
+		default:
+			log.Printf("[*] [WS] Unhandled frame type: %s", genericFrame.Type)
+		}
 	}
 }
 
-func (c *Client) handleCommandExecution(ctx context.Context, cmd CommandPayload) {
+// handleTaskDispatch streams execution output live and captures the process exit code.
+func (c *Client) handleTaskDispatch(task TaskDispatchFrame) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[-] [Panic] Command execution worker recovered: %v", r)
+			log.Printf("[-] [Task] Recovered from execution panic on TaskID [%s]: %v", task.TaskID, r)
 		}
 	}()
 
-	cmdCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
+	timeout := defaultTimeout
+	if task.TimeoutSec > 0 {
+		timeout = time.Duration(task.TimeoutSec) * time.Second
+	}
+
+	taskCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	result, err := c.executor.Execute(cmdCtx, cmd.Command)
+	// Chunk callback: Encapsulate each stdout/stderr slice into a live stream frame
+	onChunk := func(streamType string, chunk string) {
+		streamFrame := TaskStreamFrame{
+			Type:   "task_stream",
+			TaskID: task.TaskID,
+			Stream: streamType,
+			Chunk:  chunk,
+		}
+		if payload, err := json.Marshal(streamFrame); err == nil {
+			c.Send(payload)
+		}
+	}
 
-	response := CommandResponseFrame{
-		Type:            "command_result",
-		CommandID:       cmd.CommandID,
-		Stdout:          result.Stdout,
-		Stderr:          result.Stderr,
-		ExitCode:        result.ExitCode,
-		ExecutionTimeMs: result.ExecutionTimeMs,
+	exitCode, elapsedMs, err := agentExec.ExecuteStreaming(taskCtx, task.Command, onChunk)
+
+	exitFrame := TaskExitFrame{
+		Type:      "task_exit",
+		TaskID:    task.TaskID,
+		ExitCode:  exitCode,
+		ElapsedMs: elapsedMs,
 	}
 
 	if err != nil {
-		response.Error = err.Error()
+		errStr := err.Error()
+		exitFrame.Error = &errStr
 	}
 
-	payload, encErr := json.Marshal(response)
-	if encErr != nil {
-		log.Printf("[-] [WS] Failed to encode command result frame: %v", encErr)
-		return
+	if payload, encErr := json.Marshal(exitFrame); encErr == nil {
+		c.Send(payload)
 	}
 
-	if !c.Send(payload) {
-		log.Printf("[-] [WS] Failed to queue result for command [%s]: outbound buffer full", cmd.CommandID)
-	} else {
-		log.Printf("[+] [WS] Queued execution result for command [%s] (Exit Code: %d, Time: %dms)",
-			cmd.CommandID, result.ExitCode, result.ExecutionTimeMs)
-	}
+	log.Printf("[+] [Task] Completed TaskID [%s] (ExitCode: %d, Elapsed: %dms)",
+		task.TaskID, exitCode, elapsedMs)
 }
 
 func (c *Client) setConnected(status bool) {

@@ -1,14 +1,17 @@
 import hashlib
+import json
 import logging
 import secrets
 from uuid import UUID
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
+from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.core.ws_manager import ws_manager
 from app.db.session import async_session_factory
 from app.models.agent import Agent
+from app.schemas.task import TaskExitFrame, TaskStreamFrame
 
 logger = logging.getLogger("rmm.websocket")
 
@@ -51,29 +54,67 @@ async def agent_websocket_endpoint(
 ):
     """
     Secure full-duplex WebSocket endpoint for enrolled agents.
-    Enforces pre-upgrade validation, registers active socket locally,
-    and synchronizes connection state with Redis.
+    Dispatches commands and demultiplexes live streamed stdout/stderr chunks and task exits.
     """
     # 1. Pre-Accept Authentication Gate
     is_authenticated = await authenticate_agent_handshake(agent_id, token)
     if not is_authenticated:
-        # RFC-6455 1008: Policy Violation (Unauthorized handshake)
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    # 2. Upgrade Protocol & Register Active Connection (Local + Redis Sync)
+    # 2. Upgrade Protocol & Register Active Connection
     await ws_manager.connect(agent_id, websocket)
 
-    # 3. Message Loop & Persistent Telemetry Channel
+    # 3. Dedicated Inbound Message Demultiplexer Loop
     try:
         while True:
-            # Persistent non-blocking read frame loop
-            message = await websocket.receive_text()
-            logger.debug("Received payload from Agent [%s]: %s", agent_id, message)
+            raw_message = await websocket.receive_text()
+
+            try:
+                envelope = json.loads(raw_message)
+                frame_type = envelope.get("type")
+            except (json.JSONDecodeError, AttributeError):
+                logger.warning("Agent [%s] sent invalid non-JSON framing: %s", agent_id, raw_message[:64])
+                continue
+
+            if frame_type == "task_stream":
+                try:
+                    stream_frame = TaskStreamFrame.model_validate(envelope)
+                    # Tactical Log: Outputs streamed chunks live (stdout/stderr)
+                    logger.info(
+                        "[Task Stream] Agent [%s] Task [%s] [%s]: %s",
+                        agent_id,
+                        stream_frame.task_id,
+                        stream_frame.stream,
+                        stream_frame.chunk.rstrip("\r\n"),
+                    )
+                except ValidationError as val_err:
+                    logger.error("TaskStreamFrame schema error from Agent [%s]: %s", agent_id, val_err)
+
+            elif frame_type == "task_exit":
+                try:
+                    exit_frame = TaskExitFrame.model_validate(envelope)
+                    logger.info(
+                        "[+] [Task Exit] Agent [%s] Task [%s] completed with code [%d] in [%dms]",
+                        agent_id,
+                        exit_frame.task_id,
+                        exit_frame.exit_code,
+                        exit_frame.elapsed_ms,
+                    )
+                except ValidationError as val_err:
+                    logger.error("TaskExitFrame schema error from Agent [%s]: %s", agent_id, val_err)
+
+            elif frame_type == "heartbeat":
+                # Extensible heartbeat ingestion
+                logger.debug("Heartbeat received from Agent [%s]", agent_id)
+
+            else:
+                logger.warning("Agent [%s] dispatched unhandled frame type: %s", agent_id, frame_type)
+
     except WebSocketDisconnect:
         logger.info("Agent [%s] closed the WebSocket connection.", agent_id)
     except Exception as exc:
         logger.error("Unexpected socket error on Agent [%s]: %s", agent_id, exc)
     finally:
-        # 4. Mandatory Async Cleanup: Evicts local socket and purges Redis state
+        # Mandatory cleanup to prevent dangling sockets and clear Redis state
         await ws_manager.disconnect(agent_id)
