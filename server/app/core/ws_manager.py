@@ -1,5 +1,5 @@
 import logging
-from typing import Dict
+from typing import Dict, Union
 from uuid import UUID
 
 from fastapi import WebSocket
@@ -10,67 +10,96 @@ logger = logging.getLogger("rmm.websocket")
 
 class ConnectionManager:
     """
-    Manages active WebSocket connections locally and syncs
-    ephemeral agent status to a global Redis datastore.
+    Manages active WebSocket connections for endpoint agents and operators,
+    ensuring thread-safe real-time bidirectional terminal routing.
     """
 
     def __init__(self) -> None:
-        self.active_connections: Dict[UUID, WebSocket] = {}
+        # Agent socket registry: canonical string agent_id -> WebSocket
+        self.active_connections: Dict[str, WebSocket] = {}
+
+        # Operator socket registry: canonical string agent_id -> WebSocket
+        self.operator_connections: Dict[str, WebSocket] = {}
+
+        # Async Redis client for state synchronization
         self.redis_client = redis.Redis(
             host="127.0.0.1",
             port=6379,
             decode_responses=True,
         )
 
-    async def connect(self, agent_id: UUID, websocket: WebSocket) -> None:
-        """
-        Accepts the socket, stores it locally, and publishes the online
-        status to Redis with a 60-second TTL (Time-To-Live).
-        """
-        await websocket.accept()
-        self.active_connections[agent_id] = websocket
+    def _canonical_id(self, agent_id: Union[UUID, str]) -> str:
+        """Converts UUID or string to uniform lowercase string key."""
+        return str(agent_id).lower()
 
-        redis_key = f"agent:{agent_id}:status"
+    async def connect(self, agent_id: Union[UUID, str], websocket: WebSocket) -> None:
+        """Registers active agent socket and synchronizes online state to Redis."""
+        key = self._canonical_id(agent_id)
+        await websocket.accept()
+        self.active_connections[key] = websocket
+
+        redis_key = f"agent:{key}:status"
         await self.redis_client.set(name=redis_key, value="online", ex=60)
 
-        logger.info(
-            "Agent [%s] WebSocket established & synced to Redis. Active local nodes: %d",
-            agent_id,
-            len(self.active_connections),
-        )
+        logger.info("Agent [%s] WebSocket established. Active agents: %d", key, len(self.active_connections))
 
-    async def disconnect(self, agent_id: UUID) -> None:
-        """
-        Removes the socket from local memory and immediately purges
-        the online status key from Redis.
-        """
-        if agent_id in self.active_connections:
-            del self.active_connections[agent_id]
+    async def disconnect(self, agent_id: Union[UUID, str]) -> None:
+        """Purges agent socket from memory and marks offline in Redis."""
+        key = self._canonical_id(agent_id)
+        if key in self.active_connections:
+            del self.active_connections[key]
 
-        redis_key = f"agent:{agent_id}:status"
+        redis_key = f"agent:{key}:status"
         await self.redis_client.delete(redis_key)
 
-        logger.info(
-            "Agent [%s] WebSocket disconnected & removed from Redis. Active local nodes: %d",
-            agent_id,
-            len(self.active_connections),
-        )
+        logger.info("Agent [%s] WebSocket disconnected. Active agents: %d", key, len(self.active_connections))
 
-    async def send_json(self, agent_id: UUID, payload: dict) -> bool:
-        """
-        Dispatches JSON to a locally connected agent.
-        """
-        websocket = self.active_connections.get(agent_id)
-        if not websocket:
-            logger.warning("Local dispatch failed: Agent [%s] socket not in memory.", agent_id)
+    async def connect_operator(self, agent_id: Union[UUID, str], websocket: WebSocket) -> bool:
+        """Accepts operator socket only if target agent is actively registered."""
+        key = self._canonical_id(agent_id)
+        if key not in self.active_connections:
+            logger.warning("Operator denied: Target Agent [%s] is currently offline.", key)
+            return False
+
+        await websocket.accept()
+        self.operator_connections[key] = websocket
+        logger.info("Operator tunnel established for Agent [%s]. Active operators: %d", key, len(self.operator_connections))
+        return True
+
+    def disconnect_operator(self, agent_id: Union[UUID, str]) -> None:
+        """Removes operator socket from memory."""
+        key = self._canonical_id(agent_id)
+        if key in self.operator_connections:
+            del self.operator_connections[key]
+            logger.info("Operator tunnel disconnected for Agent [%s].", key)
+
+    async def route_to_operator(self, agent_id: Union[UUID, str], data: str) -> bool:
+        """Routes raw stdout/echo from Agent PTY to Operator's xterm.js."""
+        key = self._canonical_id(agent_id)
+        operator_ws = self.operator_connections.get(key)
+        if not operator_ws:
             return False
 
         try:
-            await websocket.send_json(payload)
+            await operator_ws.send_text(data)
             return True
         except Exception as exc:
-            logger.error("Error dispatching JSON to agent [%s]: %s", agent_id, exc)
-            await self.disconnect(agent_id)
+            logger.error("Failed to route data to operator [%s]: %v", key, exc)
+            self.disconnect_operator(key)
+            return False
+
+    async def route_to_agent(self, agent_id: Union[UUID, str], frame_json: str) -> bool:
+        """Routes raw keystrokes from Operator to Agent PTY."""
+        key = self._canonical_id(agent_id)
+        agent_ws = self.active_connections.get(key)
+        if not agent_ws:
+            return False
+
+        try:
+            await agent_ws.send_text(frame_json)
+            return True
+        except Exception as exc:
+            logger.error("Failed to route frame to agent [%s]: %v", key, exc)
             return False
 
 

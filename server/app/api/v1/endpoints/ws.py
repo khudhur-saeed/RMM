@@ -2,119 +2,103 @@ import hashlib
 import json
 import logging
 import secrets
+from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
-from pydantic import ValidationError
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect, status
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.session import get_db
 from app.core.ws_manager import ws_manager
-from app.db.session import async_session_factory
 from app.models.agent import Agent
-from app.schemas.task import TaskExitFrame, TaskStreamFrame
 
 logger = logging.getLogger("rmm.websocket")
 
 router = APIRouter()
 
 
-async def authenticate_agent_handshake(agent_id: UUID, token: str) -> bool:
-    """
-    Validates agent authenticity during the initial HTTP handshake.
-    Computes SHA-256 digest and performs constant-time comparison against DB hash.
-    """
-    if not token:
-        return False
-
-    computed_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-    async with async_session_factory() as session:
-        stmt = select(Agent.api_key_hash).where(Agent.id == agent_id)
-        result = await session.execute(stmt)
-        stored_hash = result.scalar_one_or_none()
-
-        if not stored_hash:
-            logger.warning("WS Auth Failed: Agent [%s] not found.", agent_id)
-            return False
-
-        # Constant-time comparison defends against timing attacks
-        is_valid = secrets.compare_digest(computed_hash, stored_hash)
-        if not is_valid:
-            logger.warning("WS Auth Failed: Invalid API key hash for Agent [%s].", agent_id)
-            return False
-
-        return True
-
-
 @router.websocket("/agent/{agent_id}")
 async def agent_websocket_endpoint(
     websocket: WebSocket,
     agent_id: UUID,
-    token: str = Query(..., description="Plaintext Agent API Key for handshake authentication"),
+    token: str = Query(...),
+    db: AsyncSession = Depends(get_db),
 ):
-    """
-    Secure full-duplex WebSocket endpoint for enrolled agents.
-    Dispatches commands and demultiplexes live streamed stdout/stderr chunks and task exits.
-    """
-    # 1. Pre-Accept Authentication Gate
-    is_authenticated = await authenticate_agent_handshake(agent_id, token)
-    if not is_authenticated:
+    # 1. المصادقة الصارمة للعميل أثناء المصافحة
+    query = await db.execute(select(Agent).where(Agent.id == agent_id))
+    agent = query.scalar_one_or_none()
+
+    if not agent or not agent.api_key_hash:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    # 2. Upgrade Protocol & Register Active Connection
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    if not secrets.compare_digest(token_hash, agent.api_key_hash):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    # 2. تسجيل الاتصال في مدير المقابس ومزامنة الحالة مع Redis
     await ws_manager.connect(agent_id, websocket)
 
-    # 3. Dedicated Inbound Message Demultiplexer Loop
+    # 3. تحديث last_seen فور نجاح الاتصال
+    await db.execute(
+        update(Agent)
+        .where(Agent.id == agent_id)
+        .values(last_seen=datetime.now(timezone.utc))
+    )
+    await db.commit()
+    logger.info("Agent [%s] connected and last_seen updated in PostgreSQL.", agent_id)
+
     try:
         while True:
-            raw_message = await websocket.receive_text()
+            data = await websocket.receive_text()
+
+            # تجديد الـ TTL في Redis وتحديث last_seen في PostgreSQL مع كل إطار
+            await ws_manager.redis_client.set(name=f"agent:{agent_id}:status", value="online", ex=60)
+            await db.execute(
+                update(Agent)
+                .where(Agent.id == agent_id)
+                .values(last_seen=datetime.now(timezone.utc))
+            )
+            await db.commit()
 
             try:
-                envelope = json.loads(raw_message)
-                frame_type = envelope.get("type")
-            except (json.JSONDecodeError, AttributeError):
-                logger.warning("Agent [%s] sent invalid non-JSON framing: %s", agent_id, raw_message[:64])
-                continue
+                payload = json.loads(data)
+                msg_type = payload.get("type")
 
-            if frame_type == "task_stream":
-                try:
-                    stream_frame = TaskStreamFrame.model_validate(envelope)
-                    # Tactical Log: Outputs streamed chunks live (stdout/stderr)
-                    logger.info(
-                        "[Task Stream] Agent [%s] Task [%s] [%s]: %s",
-                        agent_id,
-                        stream_frame.task_id,
-                        stream_frame.stream,
-                        stream_frame.chunk.rstrip("\r\n"),
-                    )
-                except ValidationError as val_err:
-                    logger.error("TaskStreamFrame schema error from Agent [%s]: %s", agent_id, val_err)
+                # تمرير مخرجات الطرفية للمشغل إن وجدت
+                if msg_type == "term_out":
+                    term_data = payload.get("payload", "")
+                    await ws_manager.route_to_operator(agent_id, term_data)
 
-            elif frame_type == "task_exit":
-                try:
-                    exit_frame = TaskExitFrame.model_validate(envelope)
-                    logger.info(
-                        "[+] [Task Exit] Agent [%s] Task [%s] completed with code [%d] in [%dms]",
-                        agent_id,
-                        exit_frame.task_id,
-                        exit_frame.exit_code,
-                        exit_frame.elapsed_ms,
-                    )
-                except ValidationError as val_err:
-                    logger.error("TaskExitFrame schema error from Agent [%s]: %s", agent_id, val_err)
-
-            elif frame_type == "heartbeat":
-                # Extensible heartbeat ingestion
-                logger.debug("Heartbeat received from Agent [%s]", agent_id)
-
-            else:
-                logger.warning("Agent [%s] dispatched unhandled frame type: %s", agent_id, frame_type)
+            except json.JSONDecodeError:
+                pass
 
     except WebSocketDisconnect:
-        logger.info("Agent [%s] closed the WebSocket connection.", agent_id)
-    except Exception as exc:
-        logger.error("Unexpected socket error on Agent [%s]: %s", agent_id, exc)
+        logger.info("Agent [%s] disconnected.", agent_id)
     finally:
-        # Mandatory cleanup to prevent dangling sockets and clear Redis state
         await ws_manager.disconnect(agent_id)
+
+
+@router.websocket("/operator/{agent_id}")
+async def operator_websocket_endpoint(
+    websocket: WebSocket,
+    agent_id: UUID,
+):
+    if not await ws_manager.connect_operator(agent_id, websocket):
+        await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
+        return
+
+    try:
+        while True:
+            raw_keystroke = await websocket.receive_text()
+            frame = json.dumps({
+                "type": "term_in",
+                "payload": raw_keystroke,
+            })
+            await ws_manager.route_to_agent(agent_id, frame)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ws_manager.disconnect_operator(agent_id)
