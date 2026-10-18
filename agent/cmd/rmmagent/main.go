@@ -4,19 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"tactical-rmm/agent/internal/client"
 	"tactical-rmm/agent/internal/config"
+	"tactical-rmm/agent/internal/service"
 	"tactical-rmm/agent/internal/system"
 	"tactical-rmm/agent/internal/ws"
 )
 
-// HeartbeatBeaconFrame models the telemetry keep-alive payload dispatched upstream
+const (
+	serviceName        = "rmmagent"
+	serviceDescription = "Tactical RMM Endpoint Management Agent"
+)
+
+// HeartbeatBeaconFrame models the telemetry keep-alive payload dispatched upstream.
 type HeartbeatBeaconFrame struct {
 	Type      string                   `json:"type"`
 	AgentID   string                   `json:"agent_id"`
@@ -26,43 +30,83 @@ type HeartbeatBeaconFrame struct {
 
 func main() {
 	var (
-		serverURL  string
-		token      string
-		caCertPath string
-		configPath string
+		serverURL     string
+		token         string
+		caCertPath    string
+		configPath    string
+		serviceAction string
 	)
 
 	flag.StringVar(&serverURL, "server", "", "FastAPI Control Plane URL (e.g. https://c2.example.com)")
 	flag.StringVar(&token, "token", "", "One-time enrollment bootstrap token")
 	flag.StringVar(&caCertPath, "ca-cert", "", "Optional path to Custom Root CA certificate")
 	flag.StringVar(&configPath, "config", config.DefaultConfigFile, "Path to local agent configuration file")
+	flag.StringVar(&serviceAction, "service", "", "Service management action: [install | uninstall]")
 	flag.Parse()
 
-	// 1. Setup Signal Context for Graceful Daemon Shutdown
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	// 1. Initialize the unified native service manager
+	svcMgr := service.NewManager(serviceName, serviceDescription)
 
-	// 2. Check for Existing Configuration (Daemon Mode vs Enrollment Mode)
+	// 2. Handle standalone service installation and removal actions
+	if serviceAction != "" {
+		handleServiceAction(svcMgr, serviceAction)
+		return
+	}
+
+	// 3. Delegate execution lifecycle to the unified service manager
+	ctx := context.Background()
+	err := svcMgr.Run(ctx, func(serviceCtx context.Context) error {
+		return runAgent(serviceCtx, serverURL, token, caCertPath, configPath)
+	})
+
+	if err != nil {
+		log.Fatalf("[-] [Service] Lifecycle error: %v", err)
+	}
+
+	log.Println("[*] Tactical RMM Agent shut down gracefully.")
+}
+
+// handleServiceAction processes CLI requests to install or uninstall the OS service.
+func handleServiceAction(mgr service.Manager, action string) {
+	switch action {
+	case "install":
+		if err := mgr.Install(); err != nil {
+			log.Fatalf("[-] Failed to install service: %v", err)
+		}
+		fmt.Printf("[+] Service %q installed and configured for automatic startup successfully.\n", serviceName)
+	case "uninstall":
+		if err := mgr.Uninstall(); err != nil {
+			log.Fatalf("[-] Failed to uninstall service: %v", err)
+		}
+		fmt.Printf("[+] Service %q stopped and removed from the system successfully.\n", serviceName)
+	default:
+		log.Fatalf("[-] Unknown service action %q. Supported actions: install, uninstall", action)
+	}
+}
+
+// runAgent orchestrates agent enrollment, configuration loading, WebSocket tunnel, and telemetry loops.
+func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath string) error {
+	// 1. Check for Existing Configuration (Daemon Mode vs Enrollment Mode)
 	agentCfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		if serverURL == "" || token == "" {
-			log.Fatalf("[-] Configuration not found at %s. To enroll, both -server and -token are required.", configPath)
+			return fmt.Errorf("configuration not found at %s (to enroll, pass -server and -token)", configPath)
 		}
 
 		log.Println("[*] Tactical RMM Agent - Initiating Endpoint Enrollment...")
 		hostInfo, err := system.CollectHostInfo()
 		if err != nil {
-			log.Fatalf("[-] Failed to collect host telemetry: %v", err)
+			return fmt.Errorf("failed to collect host telemetry: %w", err)
 		}
 
 		enrollClient, err := client.NewEnrollmentClient(serverURL, caCertPath, 15*time.Second)
 		if err != nil {
-			log.Fatalf("[-] Failed to initialize enrollment client: %v", err)
+			return fmt.Errorf("failed to initialize enrollment client: %w", err)
 		}
 
 		enrollResp, err := enrollClient.EnrollEndpoint(token, hostInfo)
 		if err != nil {
-			log.Fatalf("[-] Enrollment failed: %v", err)
+			return fmt.Errorf("enrollment failed: %w", err)
 		}
 
 		agentCfg = &config.AgentConfig{
@@ -74,14 +118,14 @@ func main() {
 		}
 
 		if err := config.SaveConfig(agentCfg, configPath); err != nil {
-			log.Fatalf("[-] Failed to securely persist credentials: %v", err)
+			return fmt.Errorf("failed to securely persist credentials: %w", err)
 		}
 		log.Printf("[+] Enrollment Successful: Assigned Agent ID = %s", agentCfg.AgentID)
 	}
 
-	log.Printf("[*] Starting Tactical RMM Agent Daemon for Agent ID [%s]...", agentCfg.AgentID)
+	log.Printf("[*] Starting Tactical RMM Agent for Agent ID [%s]...", agentCfg.AgentID)
 
-	// 3. Initialize and Start Secure WebSocket Tunnel with Pong Handling
+	// 2. Initialize and Start Secure WebSocket Tunnel
 	wsConfig := ws.Config{
 		ServerURL:  agentCfg.ServerURL,
 		AgentID:    agentCfg.AgentID,
@@ -91,19 +135,19 @@ func main() {
 
 	wsClient, err := ws.NewClient(wsConfig)
 	if err != nil {
-		log.Fatalf("[-] Failed to initialize WebSocket client: %v", err)
+		return fmt.Errorf("failed to initialize WebSocket client: %w", err)
 	}
 
 	// Launch WebSocket tunnel worker asynchronously
 	go wsClient.Run(ctx)
 
-	// 4. Run Heartbeat Loop Packaging Telemetry Snapshot
+	// 3. Run Heartbeat Loop and block until context is cancelled
 	runHeartbeatLoop(ctx, agentCfg, wsClient)
 
-	log.Println("[*] Tactical RMM Agent shut down gracefully.")
+	return nil
 }
 
-// runHeartbeatLoop gathers snapshots and sends structured telemetry beacon frames every 30 seconds
+// runHeartbeatLoop dispatches telemetry snapshots upstream every 30 seconds until context termination.
 func runHeartbeatLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -114,7 +158,6 @@ func runHeartbeatLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws
 			log.Println("[*] [Heartbeat] Context cancelled. Terminating heartbeat loop.")
 			return
 		case <-ticker.C:
-			// Capture instantaneous OS and runtime metrics
 			telemetry, err := system.CollectTelemetry()
 			if err != nil {
 				log.Printf("[-] [Heartbeat] Telemetry collection warning: %v", err)
