@@ -9,25 +9,40 @@ export default function HostDetails() {
   const [agent, setAgent] = useState(null);
   const [error, setError] = useState(null);
 
+  // Reference clock for the online indicator; ticks so the status dot stays accurate
+  const [now, setNow] = useState(() => Date.now());
+
   const terminalRef = useRef(null);
   const wsRef = useRef(null);
 
   // 1. جلب بيانات الجهاز وتحديثها دورياً
-  const fetchAgentDetails = async () => {
-    try {
-      const response = await fetch(`/api/v1/agents/${id}`);
-      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-      const data = await response.json();
-      setAgent(data);
-    } catch (err) {
-      setError(err.message);
-    }
-  };
-
   useEffect(() => {
+    let cancelled = false;
+
+    const fetchAgentDetails = () =>
+      fetch(`/api/v1/agents/${id}`)
+        .then((response) => {
+          if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+          return response.json();
+        })
+        .then((data) => {
+          if (cancelled) return;
+          setAgent(data);
+          setError(null);
+        })
+        .catch((err) => {
+          if (!cancelled) setError(err.message);
+        })
+        .finally(() => {
+          if (!cancelled) setNow(Date.now());
+        });
+
     fetchAgentDetails();
     const interval = setInterval(fetchAgentDetails, 10000);
-    return () => clearInterval(interval);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [id]);
 
   // 2. تهيئة xterm.js ومقبس المشغل التفاعلي
@@ -53,7 +68,9 @@ export default function HostDetails() {
 
     term.writeln(`[RMM Control Plane] Workspace Initialized for Host ID: ${id}`);
 
-    const wsUrl = `ws://localhost:8000/api/v1/ws/operator/${id}`;
+    // Same-origin URL so the Vite proxy (or a reverse proxy in production) forwards it
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${wsProtocol}://${window.location.host}/api/v1/ws/operator/${id}`;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
@@ -83,7 +100,7 @@ export default function HostDetails() {
     const handleResize = () => {
       try {
         fitAddon.fit();
-      } catch (e) {
+      } catch {
         // تجاهل أخطاء الحسابات في حال إعادة تموضع العنصر
       }
     };
@@ -99,8 +116,7 @@ export default function HostDetails() {
   const checkIsOnline = (lastSeen) => {
     if (!lastSeen) return false;
     const lastSeenTime = new Date(lastSeen).getTime();
-    const currentTime = Date.now();
-    const diffSeconds = (currentTime - lastSeenTime) / 1000;
+    const diffSeconds = (now - lastSeenTime) / 1000;
     return diffSeconds < 120;
   };
 

@@ -84,7 +84,7 @@ class ConnectionManager:
             await operator_ws.send_text(data)
             return True
         except Exception as exc:
-            logger.error("Failed to route data to operator [%s]: %v", key, exc)
+            logger.error("Failed to route data to operator [%s]: %s", key, exc)
             self.disconnect_operator(key)
             return False
 
@@ -99,7 +99,7 @@ class ConnectionManager:
             await agent_ws.send_text(frame_json)
             return True
         except Exception as exc:
-            logger.error("Failed to route frame to agent [%s]: %v", key, exc)
+            logger.error("Failed to route frame to agent [%s]: %s", key, exc)
             return False
 
 

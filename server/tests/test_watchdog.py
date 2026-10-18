@@ -10,6 +10,8 @@ from app.models.organization import Organization
 from app.models.site import Site
 from app.services.watchdog import evaluate_lapsed_agents
 
+from conftest import delete_organizations
+
 
 @pytest.mark.asyncio
 async def test_watchdog_detects_lapsed_agents_and_verifies_redis():
@@ -62,16 +64,18 @@ async def test_watchdog_detects_lapsed_agents_and_verifies_redis():
         session.add_all([active_agent, lapsed_agent])
         await session.commit()
 
-    # 2. Redis State Setup: Clean status keys to ensure accurate fallback check
-    await ws_manager.redis_client.delete(f"agent:{active_agent_id}:status")
-    await ws_manager.redis_client.delete(f"agent:{lapsed_agent_id}:status")
+    try:
+        # 2. Redis State Setup: Clean status keys to ensure accurate fallback check
+        await ws_manager.redis_client.delete(f"agent:{active_agent_id}:status")
+        await ws_manager.redis_client.delete(f"agent:{lapsed_agent_id}:status")
 
-    # 3. Trigger Watchdog Evaluation Sweep scoped strictly to our test agents
-    test_scope = [active_agent_id, lapsed_agent_id]
-    lapsed_count = await evaluate_lapsed_agents(threshold_seconds=90, agent_ids=test_scope)
+        # 3. Trigger Watchdog Evaluation Sweep scoped strictly to our test agents
+        test_scope = [active_agent_id, lapsed_agent_id]
+        lapsed_count = await evaluate_lapsed_agents(threshold_seconds=90, agent_ids=test_scope)
 
-    # 4. Assertions: Exactly one ghost agent must be detected among test nodes
-    assert lapsed_count == 1, f"Expected 1 lapsed agent in scope, got {lapsed_count}"
-
-    # Clean up physical engine connections
-    await engine.dispose()
+        # 4. Assertions: Exactly one ghost agent must be detected among test nodes
+        assert lapsed_count == 1, f"Expected 1 lapsed agent in scope, got {lapsed_count}"
+    finally:
+        # Purge seeded tenant (cascades to site and agents) and close engine connections
+        await delete_organizations([org_id])
+        await engine.dispose()

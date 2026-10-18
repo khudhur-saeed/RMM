@@ -48,8 +48,8 @@ async def evaluate_lapsed_agents(
                     agent.hostname,
                     agent.last_seen,
                 )
-                if agent.id in ws_manager.active_connections:
-                    ws_manager.disconnect(agent.id)
+                if str(agent.id).lower() in ws_manager.active_connections:
+                    await ws_manager.disconnect(agent.id)
 
                 lapsed_count += 1
             else:

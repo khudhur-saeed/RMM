@@ -1,8 +1,14 @@
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import agents, enroll, organizations, sites, tokens, ws
+from app.api.v1.endpoints import agents, enroll, health, organizations, sites, tokens, ws
 
 api_v1_router = APIRouter()
+
+# Control Plane Liveness & Database Connectivity
+api_v1_router.include_router(
+    health.router,
+    tags=["Health"],
+)
 
 # Multi-Tenant Core Boundaries
 api_v1_router.include_router(
