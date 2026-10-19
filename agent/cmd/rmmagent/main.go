@@ -41,13 +41,13 @@ func main() {
 	flag.StringVar(&token, "token", "", "One-time enrollment bootstrap token")
 	flag.StringVar(&caCertPath, "ca-cert", "", "Optional path to Custom Root CA certificate")
 	flag.StringVar(&configPath, "config", config.DefaultConfigFile, "Path to local agent configuration file")
-	flag.StringVar(&serviceAction, "service", "", "Service management action: [install | uninstall]")
+	flag.StringVar(&serviceAction, "service", "", "Service management action: [install | start | stop | uninstall]")
 	flag.Parse()
 
 	// 1. Initialize the unified native service manager
 	svcMgr := service.NewManager(serviceName, serviceDescription)
 
-	// 2. Handle standalone service installation and removal actions
+	// 2. Handle standalone service lifecycle actions (install, start, stop, uninstall)
 	if serviceAction != "" {
 		handleServiceAction(svcMgr, serviceAction)
 		return
@@ -66,7 +66,7 @@ func main() {
 	log.Println("[*] Tactical RMM Agent shut down gracefully.")
 }
 
-// handleServiceAction processes CLI requests to install or uninstall the OS service.
+// handleServiceAction processes CLI requests to manage the OS background service lifecycle.
 func handleServiceAction(mgr service.Manager, action string) {
 	switch action {
 	case "install":
@@ -74,13 +74,27 @@ func handleServiceAction(mgr service.Manager, action string) {
 			log.Fatalf("[-] Failed to install service: %v", err)
 		}
 		fmt.Printf("[+] Service %q installed and configured for automatic startup successfully.\n", serviceName)
+
+	case "start":
+		if err := mgr.Start(); err != nil {
+			log.Fatalf("[-] Failed to start service: %v", err)
+		}
+		fmt.Printf("[+] Service %q started successfully.\n", serviceName)
+
+	case "stop":
+		if err := mgr.Stop(); err != nil {
+			log.Fatalf("[-] Failed to stop service: %v", err)
+		}
+		fmt.Printf("[+] Service %q stopped successfully.\n", serviceName)
+
 	case "uninstall":
 		if err := mgr.Uninstall(); err != nil {
 			log.Fatalf("[-] Failed to uninstall service: %v", err)
 		}
 		fmt.Printf("[+] Service %q stopped and removed from the system successfully.\n", serviceName)
+
 	default:
-		log.Fatalf("[-] Unknown service action %q. Supported actions: install, uninstall", action)
+		log.Fatalf("[-] Unknown service action %q. Supported actions: install, start, stop, uninstall", action)
 	}
 }
 

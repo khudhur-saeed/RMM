@@ -172,3 +172,43 @@ func (m *windowsManager) Uninstall() error {
 
 	return nil
 }
+
+func (m *windowsManager) Start() error {
+	scManager, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("failed to connect to Windows Service Control Manager: %w", err)
+	}
+	defer scManager.Disconnect()
+
+	serviceHandle, err := scManager.OpenService(m.name)
+	if err != nil {
+		return ErrServiceNotInstalled
+	}
+	defer serviceHandle.Close()
+
+	if err := serviceHandle.Start(); err != nil {
+		return fmt.Errorf("failed to start windows service %s: %w", m.name, err)
+	}
+
+	return nil
+}
+
+func (m *windowsManager) Stop() error {
+	scManager, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("failed to connect to Windows Service Control Manager: %w", err)
+	}
+	defer scManager.Disconnect()
+
+	serviceHandle, err := scManager.OpenService(m.name)
+	if err != nil {
+		return ErrServiceNotInstalled
+	}
+	defer serviceHandle.Close()
+
+	if _, err := serviceHandle.Control(svc.Stop); err != nil {
+		return fmt.Errorf("failed to send stop control to windows service %s: %w", m.name, err)
+	}
+
+	return nil
+}

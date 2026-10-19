@@ -131,6 +131,30 @@ func (m *linuxManager) Uninstall() error {
 	return nil
 }
 
+func (m *linuxManager) Start() error {
+	unitPath := fmt.Sprintf("/etc/systemd/system/%s.service", m.name)
+	if _, err := os.Stat(unitPath); os.IsNotExist(err) {
+		return ErrServiceNotInstalled
+	}
+
+	if err := m.runSystemctl("start", m.name); err != nil {
+		return fmt.Errorf("failed to start %s service: %w", m.name, err)
+	}
+	return nil
+}
+
+func (m *linuxManager) Stop() error {
+	unitPath := fmt.Sprintf("/etc/systemd/system/%s.service", m.name)
+	if _, err := os.Stat(unitPath); os.IsNotExist(err) {
+		return ErrServiceNotInstalled
+	}
+
+	if err := m.runSystemctl("stop", m.name); err != nil {
+		return fmt.Errorf("failed to stop %s service: %w", m.name, err)
+	}
+	return nil
+}
+
 func (m *linuxManager) runSystemctl(args ...string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

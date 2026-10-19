@@ -5,26 +5,20 @@ import (
 	"context"
 	"errors"
 	"os/exec"
-	"syscall"
 	"time"
 )
 
 // StreamCallback represents the dispatch sink for real-time stdout/stderr chunks.
 type StreamCallback func(streamType string, chunk string)
 
-// ExecuteStreaming runs a shell command, streaming stdout and stderr in real time via chunks.
+// ExecuteStreaming runs an OS-native command, streaming stdout and stderr in real time via chunks.
 func ExecuteStreaming(ctx context.Context, command string, onChunk StreamCallback) (int, int64, error) {
 	if command == "" {
 		return -1, 0, ErrEmptyCommand
 	}
 
-	shellPath := resolveShell()
 	startTime := time.Now()
-
-	cmd := exec.CommandContext(ctx, shellPath, "-c", command)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
+	cmd := prepareStreamingCmd(ctx, command)
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
