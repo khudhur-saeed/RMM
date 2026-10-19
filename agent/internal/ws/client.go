@@ -5,9 +5,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -15,10 +15,20 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	agentExec "tactical-rmm/agent/internal/exec"
 	"tactical-rmm/agent/internal/terminal"
 )
 
-// Config encapsulates connection parameters for the secure C2 WebSocket tunnel.
+const (
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = (pongWait * 9) / 10
+	maxMessageSize = 512 * 1024 // 512 KB
+	defaultTimeout = 30 * time.Second
+)
+
+// Config defines connection parameters for the WebSocket client.
 type Config struct {
 	ServerURL  string
 	AgentID    string
@@ -26,29 +36,30 @@ type Config struct {
 	CACertPath string
 }
 
-// InboundEnvelope defines the discriminator for demultiplexing incoming frames.
+// InboundEnvelope defines the generic discriminator for demultiplexing incoming frames.
 type InboundEnvelope struct {
 	Type    string `json:"type"`
 	Payload string `json:"payload"`
 }
 
-// Client represents the persistent WebSocket agent control plane client.
+// Client encapsulates the full-duplex WebSocket connection lifecycle and interactive sessions.
 type Client struct {
-	cfg          Config
-	dialer       *websocket.Dialer
+	config       Config
+	dialer       websocket.Dialer
 	conn         *websocket.Conn
+	connMutex    sync.Mutex
 	outboundChan chan []byte
 
 	// PTY Interactive Session Management
 	termSession *terminal.Session
 	termMutex   sync.Mutex
 
-	connMutex sync.Mutex
 	isClosed  bool
 	closeOnce sync.Once
+	executor  agentExec.CommandExecutor
 }
 
-// NewClient initializes the WebSocket client enforcing TLS 1.3 and optional Root CA validation.
+// NewClient initializes the WebSocket client enforcing TLS 1.3 and Root CA verification.
 func NewClient(cfg Config) (*Client, error) {
 	tlsConfig := &tls.Config{
 		MinVersion: tls.VersionTLS13,
@@ -57,55 +68,49 @@ func NewClient(cfg Config) (*Client, error) {
 	if cfg.CACertPath != "" {
 		caCert, err := os.ReadFile(cfg.CACertPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read CA certificate: %w", err)
+			return nil, fmt.Errorf("failed to read custom Root CA certificate: %w", err)
 		}
 
-		rootPool := x509.NewCertPool()
-		if !rootPool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("failed to parse valid PEM from CA certificate")
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, errors.New("failed to append custom Root CA certificate to pool")
 		}
-		tlsConfig.RootCAs = rootPool
-	}
-
-	dialer := &websocket.Dialer{
-		TLSClientConfig:  tlsConfig,
-		HandshakeTimeout: 10 * time.Second,
+		tlsConfig.RootCAs = caCertPool
 	}
 
 	return &Client{
-		cfg:          cfg,
-		dialer:       dialer,
+		config: cfg,
+		dialer: websocket.Dialer{
+			TLSClientConfig:  tlsConfig,
+			HandshakeTimeout: 15 * time.Second,
+		},
 		outboundChan: make(chan []byte, 128),
+		executor:     agentExec.NewExecutor(),
 	}, nil
 }
 
-// buildWebSocketURL converts http(s) into ws(s) and appends authentication parameters.
 func (c *Client) buildWebSocketURL() (string, error) {
-	parsed, err := url.Parse(c.cfg.ServerURL)
+	parsed, err := url.Parse(c.config.ServerURL)
 	if err != nil {
 		return "", fmt.Errorf("invalid server URL: %w", err)
 	}
 
-	scheme := "wss"
-	if parsed.Scheme == "http" {
-		scheme = "ws"
+	scheme := "ws"
+	if parsed.Scheme == "https" || parsed.Scheme == "wss" {
+		scheme = "wss"
 	}
 
-	wsPath := fmt.Sprintf("%s/api/v1/ws/agent/%s", strings.TrimRight(parsed.Path, "/"), c.cfg.AgentID)
-	q := url.Values{}
-	q.Set("token", c.cfg.APIKey)
+	wsURL := fmt.Sprintf("%s://%s/api/v1/ws/agent/%s?token=%s",
+		scheme,
+		parsed.Host,
+		c.config.AgentID,
+		url.QueryEscape(c.config.APIKey),
+	)
 
-	u := url.URL{
-		Scheme:   scheme,
-		Host:     parsed.Host,
-		Path:     wsPath,
-		RawQuery: q.Encode(),
-	}
-
-	return u.String(), nil
+	return wsURL, nil
 }
 
-// Send enqueues payload bytes into the outbound channel without blocking the caller.
+// Send queues a payload onto the outbound channel without blocking the caller.
 func (c *Client) Send(payload []byte) bool {
 	c.connMutex.Lock()
 	closed := c.isClosed
@@ -119,13 +124,17 @@ func (c *Client) Send(payload []byte) bool {
 	case c.outboundChan <- payload:
 		return true
 	default:
-		log.Println("[-] [WS] Outbound buffer saturated. Dropping frame.")
+		log.Println("[-] [WS] Outbound buffer saturated; frame dropped")
 		return false
 	}
 }
 
-// Run executes the continuous connection supervisor with automatic reconnection.
+// Run executes the resilient connection loop with exponential backoff.
 func (c *Client) Run(ctx context.Context) {
+	baseBackoff := 2 * time.Second
+	maxBackoff := 60 * time.Second
+	currentBackoff := baseBackoff
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -137,81 +146,92 @@ func (c *Client) Run(ctx context.Context) {
 
 		wsURL, err := c.buildWebSocketURL()
 		if err != nil {
-			log.Printf("[-] [WS] URL construction error: %v", err)
+			log.Printf("[-] [WS] Configuration error: %v", err)
 			return
 		}
 
-		log.Printf("[*] [WS] Attempting secure C2 handshake: %s/api/v1/ws/agent/%s?token=***",
-			strings.Split(wsURL, "/api/v1")[0], c.cfg.AgentID)
-
-		conn, resp, err := c.dialer.DialContext(ctx, wsURL, http.Header{})
+		log.Printf("[*] [WS] Attempting secure C2 handshake: %s", sanitizeLogURL(wsURL))
+		conn, resp, err := c.dialer.DialContext(ctx, wsURL, nil)
 		if err != nil {
-			status := "unknown"
+			statusCode := 0
 			if resp != nil {
-				status = resp.Status
+				statusCode = resp.StatusCode
 			}
-			log.Printf("[-] [WS] Handshake failed (%s): %v. Retrying in 5 seconds...", status, err)
+			log.Printf("[-] [WS] Connection failed (HTTP Status: %d): %v. Retrying in %v...", statusCode, err, currentBackoff)
 
 			select {
-			case <-time.After(5 * time.Second):
+			case <-time.After(currentBackoff):
+				currentBackoff *= 2
+				if currentBackoff > maxBackoff {
+					currentBackoff = maxBackoff
+				}
 				continue
 			case <-ctx.Done():
+				c.teardown()
 				return
 			}
 		}
 
-		log.Printf("[+] [WS] Secure full-duplex tunnel established with control plane.")
+		currentBackoff = baseBackoff
 		c.connMutex.Lock()
 		c.conn = conn
 		c.isClosed = false
 		c.connMutex.Unlock()
+		log.Println("[+] [WS] Secure full-duplex tunnel established with control plane.")
 
-		var wg sync.WaitGroup
-		wg.Add(2)
+		sessionCtx, cancelSession := context.WithCancel(ctx)
+		var sessionWg sync.WaitGroup
 
+		sessionWg.Add(2)
 		go func() {
-			defer wg.Done()
-			c.writerLoop(ctx)
+			defer sessionWg.Done()
+			c.writePump(sessionCtx, conn)
 		}()
 
 		go func() {
-			defer wg.Done()
-			c.readerLoop(ctx)
+			defer sessionWg.Done()
+			c.readPump(sessionCtx, conn)
 		}()
 
-		wg.Wait()
+		// Block until socket fails or context is cancelled
+		sessionWg.Wait()
+		cancelSession()
+
+		// Clean up any interactive shell spawned during this session
 		c.cleanupSession()
 
-		log.Println("[-] [WS] Tunnel disconnected. Entering reconnect routine in 3 seconds...")
+		log.Println("[-] [WS] Session disconnected. Entering reconnect routine in 3 seconds...")
 		select {
 		case <-time.After(3 * time.Second):
 		case <-ctx.Done():
+			c.teardown()
 			return
 		}
 	}
 }
 
-// writerLoop handles thread-safe serialized frame transmissions to the socket.
-func (c *Client) writerLoop(ctx context.Context) {
+func (c *Client) writePump(ctx context.Context, conn *websocket.Conn) {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case msg, ok := <-c.outboundChan:
+		case payload, ok := <-c.outboundChan:
 			if !ok {
 				return
 			}
-			c.connMutex.Lock()
-			conn := c.conn
-			c.connMutex.Unlock()
-
-			if conn == nil {
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+				log.Printf("[-] [WS] Socket write error: %v", err)
+				_ = conn.Close()
 				return
 			}
-
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-				log.Printf("[-] [WS] Write failure: %v", err)
+		case <-ticker.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Printf("[-] [WS] Keep-alive ping failed: %v", err)
 				_ = conn.Close()
 				return
 			}
@@ -219,19 +239,24 @@ func (c *Client) writerLoop(ctx context.Context) {
 	}
 }
 
-// readerLoop demultiplexes incoming control frames and injects terminal keystrokes into PTY.
-func (c *Client) readerLoop(ctx context.Context) {
+func (c *Client) readPump(ctx context.Context, conn *websocket.Conn) {
 	defer func() {
 		c.connMutex.Lock()
 		if c.conn != nil {
 			_ = c.conn.Close()
 		}
-		c.isClosed = true
 		c.connMutex.Unlock()
 	}()
 
+	conn.SetReadLimit(maxMessageSize)
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
 	for {
-		_, message, err := c.conn.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 				log.Printf("[-] [WS] Socket error: %v", err)
@@ -247,8 +272,12 @@ func (c *Client) readerLoop(ctx context.Context) {
 		switch env.Type {
 		case "term_in":
 			c.handleTerminalInput(env.Payload)
-		case "heartbeat":
-			// Handled by background telemetry if needed
+		case "task_dispatch":
+			var dispatchFrame TaskDispatchFrame
+			if err := json.Unmarshal(message, &dispatchFrame); err == nil && dispatchFrame.Command != "" {
+				log.Printf("[+] [Task] Inbound task dispatch [%s]: %s", dispatchFrame.TaskID, dispatchFrame.Command)
+				go c.handleTaskDispatch(dispatchFrame)
+			}
 		}
 	}
 }
@@ -266,12 +295,62 @@ func (c *Client) handleTerminalInput(payload string) {
 		}
 		c.termSession = session
 		session.StartOutputPump(c.outboundChan)
-		log.Println("[+] [PTY] Interactive bash shell attached to active session.")
+		log.Println("[+] [PTY] Interactive shell attached to active session.")
 	}
 
 	if err := c.termSession.WriteInput([]byte(payload)); err != nil {
 		log.Printf("[-] [PTY] Error writing keystroke to PTY: %v", err)
 	}
+}
+
+// handleTaskDispatch streams execution output live and captures the process exit code.
+func (c *Client) handleTaskDispatch(task TaskDispatchFrame) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[-] [Task] Recovered from execution panic on TaskID [%s]: %v", task.TaskID, r)
+		}
+	}()
+
+	timeout := defaultTimeout
+	if task.TimeoutSec > 0 {
+		timeout = time.Duration(task.TimeoutSec) * time.Second
+	}
+
+	taskCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	onChunk := func(streamType string, chunk string) {
+		streamFrame := TaskStreamFrame{
+			Type:   "task_stream",
+			TaskID: task.TaskID,
+			Stream: streamType,
+			Chunk:  chunk,
+		}
+		if payload, err := json.Marshal(streamFrame); err == nil {
+			c.Send(payload)
+		}
+	}
+
+	exitCode, elapsedMs, err := agentExec.ExecuteStreaming(taskCtx, task.Command, onChunk)
+
+	exitFrame := TaskExitFrame{
+		Type:      "task_exit",
+		TaskID:    task.TaskID,
+		ExitCode:  exitCode,
+		ElapsedMs: elapsedMs,
+	}
+
+	if err != nil {
+		errStr := err.Error()
+		exitFrame.Error = &errStr
+	}
+
+	if payload, encErr := json.Marshal(exitFrame); encErr == nil {
+		c.Send(payload)
+	}
+
+	log.Printf("[+] [Task] Completed TaskID [%s] (ExitCode: %d, Elapsed: %dms)",
+		task.TaskID, exitCode, elapsedMs)
 }
 
 // cleanupSession cleanly terminates the PTY child process upon disconnection.
@@ -282,19 +361,33 @@ func (c *Client) cleanupSession() {
 	if c.termSession != nil {
 		c.termSession.Close()
 		c.termSession = nil
+		log.Println("[*] [PTY] Interactive session closed and process tree reaped.")
 	}
 }
 
-// teardown performs definitive client shutdown.
+// teardown performs definitive client shutdown with RFC-6455 close handshake.
 func (c *Client) teardown() {
 	c.closeOnce.Do(func() {
 		c.cleanupSession()
+
 		c.connMutex.Lock()
+		defer c.connMutex.Unlock()
+
 		c.isClosed = true
 		if c.conn != nil {
-			_ = c.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Agent shutting down"))
+			closeMsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Agent shutting down")
+			deadline := time.Now().Add(2 * time.Second)
+			_ = c.conn.WriteControl(websocket.CloseMessage, closeMsg, deadline)
 			_ = c.conn.Close()
+			c.conn = nil
 		}
-		c.connMutex.Unlock()
 	})
+}
+
+func sanitizeLogURL(rawURL string) string {
+	idx := strings.Index(rawURL, "token=")
+	if idx == -1 {
+		return rawURL
+	}
+	return rawURL[:idx] + "token=***"
 }
