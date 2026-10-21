@@ -40,7 +40,7 @@ func main() {
 	flag.StringVar(&serverURL, "server", "", "FastAPI Control Plane URL (e.g. https://c2.example.com)")
 	flag.StringVar(&token, "token", "", "One-time enrollment bootstrap token")
 	flag.StringVar(&caCertPath, "ca-cert", "", "Optional path to Custom Root CA certificate")
-	flag.StringVar(&configPath, "config", config.DefaultConfigFile, "Path to local agent configuration file")
+	flag.StringVar(&configPath, "config", "", "Optional path to local agent configuration file (defaults to auto-detected OS path)")
 	flag.StringVar(&serviceAction, "service", "", "Service management action: [install | start | stop | uninstall]")
 	flag.Parse()
 
@@ -100,19 +100,22 @@ func handleServiceAction(mgr service.Manager, action string) {
 
 // runAgent orchestrates agent enrollment, configuration loading, WebSocket tunnel, and telemetry loops.
 func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath string) error {
-	// 1. Check for Existing Configuration (Daemon Mode vs Enrollment Mode)
-	agentCfg, err := config.LoadConfig(configPath)
+	// Extract host telemetry and deterministic hardware UUID
+	hostInfo, err := system.CollectHostInfo()
 	if err != nil {
-		if serverURL == "" || token == "" {
-			return fmt.Errorf("configuration not found at %s (to enroll, pass -server and -token)", configPath)
-		}
+		return fmt.Errorf("failed to collect host telemetry: %w", err)
+	}
 
+	// 1. Resolve configuration with Auto-Bootstrap fallback
+	var agentCfg *config.AgentConfig
+	resolvedConfigPath := config.ResolveConfigPath(configPath)
+
+	loadedCfg, err := config.LoadConfig(resolvedConfigPath)
+	if err == nil {
+		agentCfg = loadedCfg
+	} else if serverURL != "" && token != "" {
+		// Explicit enrollment mode triggered via CLI flags
 		log.Println("[*] Tactical RMM Agent - Initiating Endpoint Enrollment...")
-		hostInfo, err := system.CollectHostInfo()
-		if err != nil {
-			return fmt.Errorf("failed to collect host telemetry: %w", err)
-		}
-
 		enrollClient, err := client.NewEnrollmentClient(serverURL, caCertPath, 15*time.Second)
 		if err != nil {
 			return fmt.Errorf("failed to initialize enrollment client: %w", err)
@@ -127,14 +130,21 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 			ServerURL:    serverURL,
 			AgentID:      enrollResp.ID,
 			APIKey:       enrollResp.APIKey,
-			CACertPath:   caCertPath,
 			HardwareUUID: hostInfo.HardwareUUID,
 		}
 
-		if err := config.SaveConfig(agentCfg, configPath); err != nil {
+		if err := config.SaveConfig(agentCfg, resolvedConfigPath); err != nil {
 			return fmt.Errorf("failed to securely persist credentials: %w", err)
 		}
 		log.Printf("[+] Enrollment Successful: Assigned Agent ID = %s", agentCfg.AgentID)
+	} else {
+		// Zero-touch service bootstrap: generate clean bootstrap config to keep service alive
+		bootstrapCfg, bootstrapPath, bootstrapErr := config.EnsureBootstrapConfig(resolvedConfigPath, hostInfo.HardwareUUID)
+		if bootstrapErr != nil {
+			return fmt.Errorf("configuration unavailable and bootstrap generation failed: %w", bootstrapErr)
+		}
+		agentCfg = bootstrapCfg
+		log.Printf("[*] Zero-Touch Bootstrap initialized at [%s] for Agent ID [%s]", bootstrapPath, agentCfg.AgentID)
 	}
 
 	log.Printf("[*] Starting Tactical RMM Agent for Agent ID [%s]...", agentCfg.AgentID)
@@ -144,7 +154,7 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 		ServerURL:  agentCfg.ServerURL,
 		AgentID:    agentCfg.AgentID,
 		APIKey:     agentCfg.APIKey,
-		CACertPath: agentCfg.CACertPath,
+		CACertPath: caCertPath,
 	}
 
 	wsClient, err := ws.NewClient(wsConfig)
