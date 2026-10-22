@@ -35,25 +35,36 @@ func main() {
 		caCertPath    string
 		configPath    string
 		serviceAction string
+		enrollOnly    bool
 	)
 
 	flag.StringVar(&serverURL, "server", "", "FastAPI Control Plane URL (e.g. https://c2.example.com)")
 	flag.StringVar(&token, "token", "", "One-time enrollment bootstrap token")
 	flag.StringVar(&caCertPath, "ca-cert", "", "Optional path to Custom Root CA certificate")
-	flag.StringVar(&configPath, "config", "", "Optional path to local agent configuration file (defaults to auto-detected OS path)")
+	flag.StringVar(&configPath, "config", "", "Optional path to local agent configuration file")
 	flag.StringVar(&serviceAction, "service", "", "Service management action: [install | start | stop | uninstall]")
+	flag.BoolVar(&enrollOnly, "enroll-only", false, "Perform identity bootstrap enrollment and exit immediately")
 	flag.Parse()
 
-	// 1. Initialize the unified native service manager
+	// 1. If explicit enrollment flag is passed, execute enrollment and exit
+	if enrollOnly || (serverURL != "" && token != "" && serviceAction == "") {
+		if err := bootstrapEnrollment(serverURL, token, caCertPath, configPath); err != nil {
+			log.Fatalf("[-] Enrollment failure: %v", err)
+		}
+		log.Println("[+] Enrollment bootstrap completed successfully.")
+		return
+	}
+
+	// 2. Initialize the unified native service manager
 	svcMgr := service.NewManager(serviceName, serviceDescription)
 
-	// 2. Handle standalone service lifecycle actions (install, start, stop, uninstall)
+	// 3. Handle standalone service lifecycle actions (install, start, stop, uninstall)
 	if serviceAction != "" {
 		handleServiceAction(svcMgr, serviceAction)
 		return
 	}
 
-	// 3. Delegate execution lifecycle to the unified service manager
+	// 4. Delegate execution lifecycle to the unified service manager
 	ctx := context.Background()
 	err := svcMgr.Run(ctx, func(serviceCtx context.Context) error {
 		return runAgent(serviceCtx, serverURL, token, caCertPath, configPath)
@@ -66,7 +77,6 @@ func main() {
 	log.Println("[*] Tactical RMM Agent shut down gracefully.")
 }
 
-// handleServiceAction processes CLI requests to manage the OS background service lifecycle.
 func handleServiceAction(mgr service.Manager, action string) {
 	switch action {
 	case "install":
@@ -98,58 +108,56 @@ func handleServiceAction(mgr service.Manager, action string) {
 	}
 }
 
-// runAgent orchestrates agent enrollment, configuration loading, WebSocket tunnel, and telemetry loops.
-func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath string) error {
-	// Extract host telemetry and deterministic hardware UUID
+func bootstrapEnrollment(serverURL, token, caCertPath, configPath string) error {
+	resolvedPath := config.ResolveConfigPath(configPath)
+
+	// If existing valid config exists, log and exit cleanly
+	if cfg, err := config.LoadConfig(resolvedPath); err == nil && cfg.AgentID != "" && cfg.APIKey != "" {
+		log.Printf("[+] Valid existing configuration found for Agent ID [%s]. Skipping re-enrollment.", cfg.AgentID)
+		return nil
+	}
+
 	hostInfo, err := system.CollectHostInfo()
 	if err != nil {
 		return fmt.Errorf("failed to collect host telemetry: %w", err)
 	}
 
-	// 1. Resolve configuration with Auto-Bootstrap fallback
-	var agentCfg *config.AgentConfig
+	log.Println("[*] Tactical RMM Agent - Initiating Endpoint Enrollment...")
+	enrollClient, err := client.NewEnrollmentClient(serverURL, caCertPath, 15*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to initialize enrollment client: %w", err)
+	}
+
+	enrollResp, err := enrollClient.EnrollEndpoint(token, hostInfo)
+	if err != nil {
+		return fmt.Errorf("enrollment failed: %w", err)
+	}
+
+	agentCfg := &config.AgentConfig{
+		ServerURL:    serverURL,
+		AgentID:      enrollResp.ID,
+		APIKey:       enrollResp.APIKey,
+		CACertPath:   caCertPath,
+		HardwareUUID: hostInfo.HardwareUUID,
+	}
+
+	if err := config.SaveConfig(agentCfg, resolvedPath); err != nil {
+		return fmt.Errorf("failed to securely persist credentials: %w", err)
+	}
+	log.Printf("[+] Enrollment Successful: Assigned Agent ID = %s", agentCfg.AgentID)
+	return nil
+}
+
+func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath string) error {
 	resolvedConfigPath := config.ResolveConfigPath(configPath)
 
-	loadedCfg, err := config.LoadConfig(resolvedConfigPath)
-	if err == nil {
-		agentCfg = loadedCfg
-	} else if serverURL != "" && token != "" {
-		// Explicit enrollment mode triggered via CLI flags
-		log.Println("[*] Tactical RMM Agent - Initiating Endpoint Enrollment...")
-		enrollClient, err := client.NewEnrollmentClient(serverURL, caCertPath, 15*time.Second)
-		if err != nil {
-			return fmt.Errorf("failed to initialize enrollment client: %w", err)
-		}
-
-		enrollResp, err := enrollClient.EnrollEndpoint(token, hostInfo)
-		if err != nil {
-			return fmt.Errorf("enrollment failed: %w", err)
-		}
-
-		agentCfg = &config.AgentConfig{
-			ServerURL:    serverURL,
-			AgentID:      enrollResp.ID,
-			APIKey:       enrollResp.APIKey,
-			HardwareUUID: hostInfo.HardwareUUID,
-		}
-
-		if err := config.SaveConfig(agentCfg, resolvedConfigPath); err != nil {
-			return fmt.Errorf("failed to securely persist credentials: %w", err)
-		}
-		log.Printf("[+] Enrollment Successful: Assigned Agent ID = %s", agentCfg.AgentID)
-	} else {
-		// Zero-touch service bootstrap: generate clean bootstrap config to keep service alive
-		bootstrapCfg, bootstrapPath, bootstrapErr := config.EnsureBootstrapConfig(resolvedConfigPath, hostInfo.HardwareUUID)
-		if bootstrapErr != nil {
-			return fmt.Errorf("configuration unavailable and bootstrap generation failed: %w", bootstrapErr)
-		}
-		agentCfg = bootstrapCfg
-		log.Printf("[*] Zero-Touch Bootstrap initialized at [%s] for Agent ID [%s]", bootstrapPath, agentCfg.AgentID)
+	agentCfg, err := config.LoadConfig(resolvedConfigPath)
+	if err != nil {
+		return fmt.Errorf("failed to load configuration at %s: %w", resolvedConfigPath, err)
 	}
 
 	log.Printf("[*] Starting Tactical RMM Agent for Agent ID [%s]...", agentCfg.AgentID)
 
-	// 2. Initialize and Start Secure WebSocket Tunnel
 	wsConfig := ws.Config{
 		ServerURL:  agentCfg.ServerURL,
 		AgentID:    agentCfg.AgentID,
@@ -162,16 +170,12 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 		return fmt.Errorf("failed to initialize WebSocket client: %w", err)
 	}
 
-	// Launch WebSocket tunnel worker asynchronously
 	go wsClient.Run(ctx)
-
-	// 3. Run Heartbeat Loop and block until context is cancelled
 	runHeartbeatLoop(ctx, agentCfg, wsClient)
 
 	return nil
 }
 
-// runHeartbeatLoop dispatches telemetry snapshots upstream every 30 seconds until context termination.
 func runHeartbeatLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
