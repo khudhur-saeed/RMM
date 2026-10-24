@@ -20,7 +20,6 @@ const (
 	serviceDescription = "Tactical RMM Endpoint Management Agent"
 )
 
-// HeartbeatBeaconFrame models the telemetry keep-alive payload dispatched upstream.
 type HeartbeatBeaconFrame struct {
 	Type      string                   `json:"type"`
 	AgentID   string                   `json:"agent_id"`
@@ -41,12 +40,12 @@ func main() {
 	flag.StringVar(&serverURL, "server", "", "FastAPI Control Plane URL (e.g. https://c2.example.com)")
 	flag.StringVar(&token, "token", "", "One-time enrollment bootstrap token")
 	flag.StringVar(&caCertPath, "ca-cert", "", "Optional path to Custom Root CA certificate")
-	flag.StringVar(&configPath, "config", "", "Optional path to local agent configuration file")
+	flag.StringVar(&configPath, "config", "", "Optional path to local agent configuration file (defaults to auto-detected OS path)")
 	flag.StringVar(&serviceAction, "service", "", "Service management action: [install | start | stop | uninstall]")
 	flag.BoolVar(&enrollOnly, "enroll-only", false, "Perform identity bootstrap enrollment and exit immediately")
 	flag.Parse()
 
-	// 1. If explicit enrollment flag is passed, execute enrollment and exit
+	// 1. مسار التسجيل المستقل والخروج الفوري
 	if enrollOnly || (serverURL != "" && token != "" && serviceAction == "") {
 		if err := bootstrapEnrollment(serverURL, token, caCertPath, configPath); err != nil {
 			log.Fatalf("[-] Enrollment failure: %v", err)
@@ -55,16 +54,14 @@ func main() {
 		return
 	}
 
-	// 2. Initialize the unified native service manager
+	// 2. إدارة دورة حياة الخدمة عبر سطر الأوامر
 	svcMgr := service.NewManager(serviceName, serviceDescription)
-
-	// 3. Handle standalone service lifecycle actions (install, start, stop, uninstall)
 	if serviceAction != "" {
 		handleServiceAction(svcMgr, serviceAction)
 		return
 	}
 
-	// 4. Delegate execution lifecycle to the unified service manager
+	// 3. التشغيل الدائم كخدمة خلفية
 	ctx := context.Background()
 	err := svcMgr.Run(ctx, func(serviceCtx context.Context) error {
 		return runAgent(serviceCtx, serverURL, token, caCertPath, configPath)
@@ -84,25 +81,21 @@ func handleServiceAction(mgr service.Manager, action string) {
 			log.Fatalf("[-] Failed to install service: %v", err)
 		}
 		fmt.Printf("[+] Service %q installed and configured for automatic startup successfully.\n", serviceName)
-
 	case "start":
 		if err := mgr.Start(); err != nil {
 			log.Fatalf("[-] Failed to start service: %v", err)
 		}
 		fmt.Printf("[+] Service %q started successfully.\n", serviceName)
-
 	case "stop":
 		if err := mgr.Stop(); err != nil {
 			log.Fatalf("[-] Failed to stop service: %v", err)
 		}
 		fmt.Printf("[+] Service %q stopped successfully.\n", serviceName)
-
 	case "uninstall":
 		if err := mgr.Uninstall(); err != nil {
 			log.Fatalf("[-] Failed to uninstall service: %v", err)
 		}
 		fmt.Printf("[+] Service %q stopped and removed from the system successfully.\n", serviceName)
-
 	default:
 		log.Fatalf("[-] Unknown service action %q. Supported actions: install, start, stop, uninstall", action)
 	}
@@ -111,16 +104,11 @@ func handleServiceAction(mgr service.Manager, action string) {
 func bootstrapEnrollment(serverURL, token, caCertPath, configPath string) error {
 	resolvedPath := config.ResolveConfigPath(configPath)
 
-	// If existing valid config exists, log and exit cleanly
-	if cfg, err := config.LoadConfig(resolvedPath); err == nil && cfg.AgentID != "" && cfg.APIKey != "" {
-		log.Printf("[+] Valid existing configuration found for Agent ID [%s]. Skipping re-enrollment.", cfg.AgentID)
-		return nil
-	}
-
 	hostInfo, err := system.CollectHostInfo()
 	if err != nil {
 		return fmt.Errorf("failed to collect host telemetry: %w", err)
 	}
+	hostInfo.HardwareUUID = system.GetOrCreateHardwareUUID(hostInfo.MACAddresses, hostInfo.Hostname)
 
 	log.Println("[*] Tactical RMM Agent - Initiating Endpoint Enrollment...")
 	enrollClient, err := client.NewEnrollmentClient(serverURL, caCertPath, 15*time.Second)
