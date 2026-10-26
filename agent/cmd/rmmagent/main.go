@@ -12,6 +12,7 @@ import (
 	"tactical-rmm/agent/internal/config"
 	"tactical-rmm/agent/internal/service"
 	"tactical-rmm/agent/internal/system"
+	"tactical-rmm/agent/internal/telemetry"
 	"tactical-rmm/agent/internal/ws"
 )
 
@@ -20,6 +21,7 @@ const (
 	serviceDescription = "Tactical RMM Endpoint Management Agent"
 )
 
+// HeartbeatBeaconFrame models the lightweight keep-alive payload dispatched upstream.
 type HeartbeatBeaconFrame struct {
 	Type      string                   `json:"type"`
 	AgentID   string                   `json:"agent_id"`
@@ -45,7 +47,7 @@ func main() {
 	flag.BoolVar(&enrollOnly, "enroll-only", false, "Perform identity bootstrap enrollment and exit immediately")
 	flag.Parse()
 
-	// 1. مسار التسجيل المستقل والخروج الفوري
+	// 1. Independent bootstrap enrollment mode
 	if enrollOnly || (serverURL != "" && token != "" && serviceAction == "") {
 		if err := bootstrapEnrollment(serverURL, token, caCertPath, configPath); err != nil {
 			log.Fatalf("[-] Enrollment failure: %v", err)
@@ -54,14 +56,14 @@ func main() {
 		return
 	}
 
-	// 2. إدارة دورة حياة الخدمة عبر سطر الأوامر
+	// 2. Service lifecycle control via CLI
 	svcMgr := service.NewManager(serviceName, serviceDescription)
 	if serviceAction != "" {
 		handleServiceAction(svcMgr, serviceAction)
 		return
 	}
 
-	// 3. التشغيل الدائم كخدمة خلفية
+	// 3. Daemon execution mode under OS service supervision
 	ctx := context.Background()
 	err := svcMgr.Run(ctx, func(serviceCtx context.Context) error {
 		return runAgent(serviceCtx, serverURL, token, caCertPath, configPath)
@@ -158,7 +160,13 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 		return fmt.Errorf("failed to initialize WebSocket client: %w", err)
 	}
 
+	// Launch WebSocket tunnel supervisor asynchronously
 	go wsClient.Run(ctx)
+
+	// Launch Comprehensive Hardware Telemetry Loop (every 60 seconds) in background
+	go runHardwareTelemetryLoop(ctx, agentCfg, wsClient)
+
+	// Run Heartbeat Loop (every 30 seconds) and block until context is cancelled
 	runHeartbeatLoop(ctx, agentCfg, wsClient)
 
 	return nil
@@ -174,16 +182,16 @@ func runHeartbeatLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws
 			log.Println("[*] [Heartbeat] Context cancelled. Terminating heartbeat loop.")
 			return
 		case <-ticker.C:
-			telemetry, err := system.CollectTelemetry()
+			telemetrySnapshot, err := system.CollectTelemetry()
 			if err != nil {
-				log.Printf("[-] [Heartbeat] Telemetry collection warning: %v", err)
+				log.Printf("[-] [Heartbeat] Self-telemetry collection warning: %v", err)
 			}
 
 			frame := HeartbeatBeaconFrame{
 				Type:      "heartbeat",
 				AgentID:   cfg.AgentID,
 				Timestamp: time.Now().Unix(),
-				Telemetry: telemetry,
+				Telemetry: telemetrySnapshot,
 			}
 
 			payload, err := json.Marshal(frame)
@@ -193,10 +201,49 @@ func runHeartbeatLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws
 			}
 
 			if queued := wsClient.Send(payload); queued {
-				log.Printf("[+] [Heartbeat] Telemetry beacon queued (Mem: %dMB, Goroutines: %d, Uptime: %ds, Payload: %d bytes)",
-					telemetry.MemoryAllocMB, telemetry.NumGoroutine, telemetry.UptimeSeconds, len(payload))
+				log.Printf("[+] [Heartbeat] Lightweight beacon queued (Agent Heap: %dMB, Goroutines: %d, Uptime: %ds)",
+					telemetrySnapshot.MemoryAllocMB, telemetrySnapshot.NumGoroutine, telemetrySnapshot.UptimeSeconds)
 			} else {
-				log.Printf("[-] [Heartbeat] Outbound buffer saturated; dropped telemetry frame for Agent [%s]", cfg.AgentID)
+				log.Printf("[-] [Heartbeat] Outbound buffer saturated; dropped heartbeat frame for Agent [%s]", cfg.AgentID)
+			}
+		}
+	}
+}
+
+func runHardwareTelemetryLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[*] [HardwareTelemetry] Context cancelled. Terminating collector loop.")
+			return
+		case <-ticker.C:
+			frame, err := telemetry.CollectHardwareTelemetry(cfg.AgentID)
+			if err != nil {
+				log.Printf("[-] [HardwareTelemetry] Metric aggregation fault: %v", err)
+				continue
+			}
+
+			payload, err := json.Marshal(frame)
+			if err != nil {
+				log.Printf("[-] [HardwareTelemetry] JSON serialization failure: %v", err)
+				continue
+			}
+
+			if queued := wsClient.Send(payload); queued {
+				log.Printf("[+] [HardwareTelemetry] Host metrics queued (CPU: %.2f%% [%d cores], RAM Used: %.2f%% [%dMB/%dMB], Disks: %d partitions, Payload: %d bytes)",
+					frame.CPU.UsagePercent,
+					frame.CPU.LogicalCores,
+					frame.Memory.UsedPercent,
+					frame.Memory.UsedBytes/(1024*1024),
+					frame.Memory.TotalBytes/(1024*1024),
+					len(frame.Disks),
+					len(payload),
+				)
+			} else {
+				log.Printf("[-] [HardwareTelemetry] Outbound buffer saturated; dropped frame for Agent [%s]", cfg.AgentID)
 			}
 		}
 	}
