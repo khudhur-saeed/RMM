@@ -11,6 +11,7 @@ import (
 	"tactical-rmm/agent/internal/client"
 	"tactical-rmm/agent/internal/config"
 	"tactical-rmm/agent/internal/netstat"
+	"tactical-rmm/agent/internal/process"
 	"tactical-rmm/agent/internal/service"
 	"tactical-rmm/agent/internal/system"
 	"tactical-rmm/agent/internal/telemetry"
@@ -170,6 +171,9 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 	// Launch Network Socket Inspection Loop (every 30 seconds) in background
 	go runNetworkTelemetryLoop(ctx, agentCfg, wsClient)
 
+	// Launch Active Process Enumeration Loop (every 60 seconds) in background (Day 31)
+	go runProcessTelemetryLoop(ctx, agentCfg, wsClient)
+
 	// Run Heartbeat Loop (every 30 seconds) and block until context is cancelled
 	runHeartbeatLoop(ctx, agentCfg, wsClient)
 
@@ -259,15 +263,15 @@ func runNetworkTelemetryLoop(ctx context.Context, cfg *config.AgentConfig, wsCli
 	defer ticker.Stop()
 
 	// Initial immediate socket inspection on startup
-	dispatchNetworkSnapshot(cfg.AgentID, inspector, wsClient)
+	go dispatchNetworkSnapshot(cfg.AgentID, inspector, wsClient)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("[*] [Netstat] Context cancelled. Terminating network telemetry loop.")
+			log.Println("[*] [NetworkTelemetry] Context cancelled. Terminating network loop.")
 			return
 		case <-ticker.C:
-			dispatchNetworkSnapshot(cfg.AgentID, inspector, wsClient)
+			go dispatchNetworkSnapshot(cfg.AgentID, inspector, wsClient)
 		}
 	}
 }
@@ -275,21 +279,62 @@ func runNetworkTelemetryLoop(ctx context.Context, cfg *config.AgentConfig, wsCli
 func dispatchNetworkSnapshot(agentID string, inspector netstat.Inspector, wsClient *ws.Client) {
 	sockets, err := inspector.GetActiveSockets()
 	if err != nil {
-		log.Printf("[-] [Netstat] Socket inspection fault: %v", err)
+		log.Printf("[-] [NetworkTelemetry] Socket inspection failed: %v", err)
 		return
 	}
 
 	snapshot := netstat.BuildSnapshot(agentID, sockets)
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
-		log.Printf("[-] [Netstat] JSON serialization failure: %v", err)
+		log.Printf("[-] [NetworkTelemetry] Serialization failed: %v", err)
 		return
 	}
 
 	if queued := wsClient.Send(payload); queued {
-		log.Printf("[+] [Netstat] Sockets queued (%d active listeners & established connections, Payload: %d bytes)",
-			len(sockets), len(payload))
+		log.Printf("[+] [NetworkTelemetry] Network snapshot queued (%d active sockets, Payload: %d bytes)", len(sockets), len(payload))
 	} else {
-		log.Printf("[-] [Netstat] Outbound buffer saturated; dropped network frame for Agent [%s]", agentID)
+		log.Printf("[-] [NetworkTelemetry] Outbound buffer saturated; dropped network frame for Agent [%s]", agentID)
+	}
+}
+
+// runProcessTelemetryLoop manages the periodic active process collection loop (Day 31).
+func runProcessTelemetryLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
+	inspector := process.NewInspector()
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	// Initial immediate process snapshot on startup
+	go dispatchProcessSnapshot(cfg.AgentID, inspector, wsClient)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[*] [ProcessTelemetry] Context cancelled. Terminating process loop.")
+			return
+		case <-ticker.C:
+			go dispatchProcessSnapshot(cfg.AgentID, inspector, wsClient)
+		}
+	}
+}
+
+// dispatchProcessSnapshot extracts active processes, encapsulates the telemetry frame, and queues it upstream.
+func dispatchProcessSnapshot(agentID string, inspector process.Inspector, wsClient *ws.Client) {
+	processes, err := inspector.GetRunningProcesses()
+	if err != nil {
+		log.Printf("[-] [ProcessTelemetry] Process enumeration failed: %v", err)
+		return
+	}
+
+	snapshot := process.BuildSnapshot(agentID, processes)
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		log.Printf("[-] [ProcessTelemetry] Serialization failed: %v", err)
+		return
+	}
+
+	if queued := wsClient.Send(payload); queued {
+		log.Printf("[+] [ProcessTelemetry] Process snapshot queued (%d active processes, Payload: %d bytes)", len(processes), len(payload))
+	} else {
+		log.Printf("[-] [ProcessTelemetry] Outbound buffer saturated; dropped process frame for Agent [%s]", agentID)
 	}
 }
