@@ -8,9 +8,11 @@ import (
 	"log"
 	"time"
 
+	"tactical-rmm/agent/internal/authmon"
 	"tactical-rmm/agent/internal/client"
 	"tactical-rmm/agent/internal/config"
 	"tactical-rmm/agent/internal/eventlog"
+	"tactical-rmm/agent/internal/fim"
 	"tactical-rmm/agent/internal/netstat"
 	"tactical-rmm/agent/internal/process"
 	"tactical-rmm/agent/internal/service"
@@ -177,6 +179,12 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 
 	// Launch Windows Security Event Log Reader (every 15 seconds) in background
 	go runSecurityEventLoop(ctx, agentCfg, wsClient)
+
+	// Launch Linux Authentication Monitor Loop (every 5 seconds) in background (Day 33)
+	go runAuthMonitorLoop(ctx, agentCfg, wsClient)
+
+	// Launch Linux File Integrity Monitoring Loop (every 60 seconds) in background (Day 33)
+	go runFIMLoop(ctx, agentCfg, wsClient)
 
 	// Run Heartbeat Loop (every 30 seconds) and block until context is cancelled
 	runHeartbeatLoop(ctx, agentCfg, wsClient)
@@ -380,5 +388,79 @@ func dispatchSecurityEvents(agentID string, watcher *eventlog.Watcher, wsClient 
 		log.Printf("[+] [SecurityEvent] Critical security events dispatched (%d events, Payload: %d bytes)", len(events), len(payload))
 	} else {
 		log.Printf("[-] [SecurityEvent] Outbound buffer saturated; dropped event frame for Agent [%s]", agentID)
+	}
+}
+
+// runAuthMonitorLoop inspects Linux auth.log every 5 seconds and dispatches detected events upstream (Day 33).
+func runAuthMonitorLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
+	watcher := authmon.NewWatcher()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[*] [AuthMon] Context cancelled. Terminating authentication monitor loop.")
+			return
+		case <-ticker.C:
+			events, err := watcher.ReadNewEvents()
+			if err != nil {
+				log.Printf("[-] [AuthMon] Inspection error: %v", err)
+				continue
+			}
+
+			if len(events) == 0 {
+				continue
+			}
+
+			frame := authmon.BuildAuthEventFrame(cfg.AgentID, events)
+			payload, err := json.Marshal(frame)
+			if err != nil {
+				log.Printf("[-] [AuthMon] JSON serialization fault: %v", err)
+				continue
+			}
+
+			if queued := wsClient.Send(payload); queued {
+				log.Printf("[+] [AuthMon] Forensic events dispatched (%d events, Payload: %d bytes)", len(events), len(payload))
+			} else {
+				log.Printf("[-] [AuthMon] Outbound buffer saturated; dropped frame for Agent [%s]", cfg.AgentID)
+			}
+		}
+	}
+}
+
+// runFIMLoop evaluates cryptographic SHA-256 drift across monitored paths every 60 seconds (Day 33).
+func runFIMLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
+	scanner := fim.NewScanner(nil)
+	scanner.InitializeBaseline()
+	log.Println("[+] [FIM] Cryptographic baseline established for critical system paths.")
+
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[*] [FIM] Context cancelled. Terminating file integrity loop.")
+			return
+		case <-ticker.C:
+			alerts := scanner.ScanTargets()
+			if len(alerts) == 0 {
+				continue
+			}
+
+			frame := fim.BuildFIMReportFrame(cfg.AgentID, alerts)
+			payload, err := json.Marshal(frame)
+			if err != nil {
+				log.Printf("[-] [FIM] JSON serialization fault: %v", err)
+				continue
+			}
+
+			if queued := wsClient.Send(payload); queued {
+				log.Printf("[!] [FIM] Cryptographic drift alerts dispatched (%d alerts, Payload: %d bytes)", len(alerts), len(payload))
+			} else {
+				log.Printf("[-] [FIM] Outbound buffer saturated; dropped frame for Agent [%s]", cfg.AgentID)
+			}
+		}
 	}
 }
