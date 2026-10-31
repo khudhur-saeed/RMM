@@ -10,6 +10,7 @@ import (
 
 	"tactical-rmm/agent/internal/client"
 	"tactical-rmm/agent/internal/config"
+	"tactical-rmm/agent/internal/eventlog"
 	"tactical-rmm/agent/internal/netstat"
 	"tactical-rmm/agent/internal/process"
 	"tactical-rmm/agent/internal/service"
@@ -44,7 +45,7 @@ func main() {
 	flag.StringVar(&serverURL, "server", "", "FastAPI Control Plane URL (e.g. https://c2.example.com)")
 	flag.StringVar(&token, "token", "", "One-time enrollment bootstrap token")
 	flag.StringVar(&caCertPath, "ca-cert", "", "Optional path to Custom Root CA certificate")
-	flag.StringVar(&configPath, "config", "", "Optional path to local agent configuration file (defaults to auto-detected OS path)")
+	flag.StringVar(&configPath, "config", "", "Optional path to local agent configuration file")
 	flag.StringVar(&serviceAction, "service", "", "Service management action: [install | start | stop | uninstall]")
 	flag.BoolVar(&enrollOnly, "enroll-only", false, "Perform identity bootstrap enrollment and exit immediately")
 	flag.Parse()
@@ -171,8 +172,11 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 	// Launch Network Socket Inspection Loop (every 30 seconds) in background
 	go runNetworkTelemetryLoop(ctx, agentCfg, wsClient)
 
-	// Launch Active Process Enumeration Loop (every 60 seconds) in background (Day 31)
+	// Launch Process Monitoring Loop (every 60 seconds) in background
 	go runProcessTelemetryLoop(ctx, agentCfg, wsClient)
+
+	// Launch Windows Security Event Log Reader (every 15 seconds) in background
+	go runSecurityEventLoop(ctx, agentCfg, wsClient)
 
 	// Run Heartbeat Loop (every 30 seconds) and block until context is cancelled
 	runHeartbeatLoop(ctx, agentCfg, wsClient)
@@ -241,12 +245,10 @@ func runHardwareTelemetryLoop(ctx context.Context, cfg *config.AgentConfig, wsCl
 			}
 
 			if queued := wsClient.Send(payload); queued {
-				log.Printf("[+] [HardwareTelemetry] Host metrics queued (CPU: %.2f%% [%d cores], RAM Used: %.2f%% [%dMB/%dMB], Disks: %d partitions, Payload: %d bytes)",
+				log.Printf("[+] [HardwareTelemetry] Host metrics queued (CPU: %.2f%% [%d cores], RAM Used: %.2f%%, Disks: %d, Payload: %d bytes)",
 					frame.CPU.UsagePercent,
 					frame.CPU.LogicalCores,
 					frame.Memory.UsedPercent,
-					frame.Memory.UsedBytes/(1024*1024),
-					frame.Memory.TotalBytes/(1024*1024),
 					len(frame.Disks),
 					len(payload),
 				)
@@ -291,13 +293,12 @@ func dispatchNetworkSnapshot(agentID string, inspector netstat.Inspector, wsClie
 	}
 
 	if queued := wsClient.Send(payload); queued {
-		log.Printf("[+] [NetworkTelemetry] Network snapshot queued (%d active sockets, Payload: %d bytes)", len(sockets), len(payload))
+		log.Printf("[+] [NetworkTelemetry] Sockets queued (%d active connections, Payload: %d bytes)", len(sockets), len(payload))
 	} else {
-		log.Printf("[-] [NetworkTelemetry] Outbound buffer saturated; dropped network frame for Agent [%s]", agentID)
+		log.Printf("[-] [NetworkTelemetry] Outbound buffer saturated; dropped frame for Agent [%s]", agentID)
 	}
 }
 
-// runProcessTelemetryLoop manages the periodic active process collection loop (Day 31).
 func runProcessTelemetryLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
 	inspector := process.NewInspector()
 	ticker := time.NewTicker(60 * time.Second)
@@ -317,11 +318,10 @@ func runProcessTelemetryLoop(ctx context.Context, cfg *config.AgentConfig, wsCli
 	}
 }
 
-// dispatchProcessSnapshot extracts active processes, encapsulates the telemetry frame, and queues it upstream.
 func dispatchProcessSnapshot(agentID string, inspector process.Inspector, wsClient *ws.Client) {
 	processes, err := inspector.GetRunningProcesses()
 	if err != nil {
-		log.Printf("[-] [ProcessTelemetry] Process enumeration failed: %v", err)
+		log.Printf("[-] [ProcessTelemetry] Inspection failed: %v", err)
 		return
 	}
 
@@ -333,8 +333,52 @@ func dispatchProcessSnapshot(agentID string, inspector process.Inspector, wsClie
 	}
 
 	if queued := wsClient.Send(payload); queued {
-		log.Printf("[+] [ProcessTelemetry] Process snapshot queued (%d active processes, Payload: %d bytes)", len(processes), len(payload))
+		log.Printf("[+] [ProcessTelemetry] Snapshot queued (%d active processes, Payload: %d bytes)", len(processes), len(payload))
 	} else {
-		log.Printf("[-] [ProcessTelemetry] Outbound buffer saturated; dropped process frame for Agent [%s]", agentID)
+		log.Printf("[-] [ProcessTelemetry] Outbound buffer saturated; dropped frame for Agent [%s]", agentID)
+	}
+}
+
+func runSecurityEventLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
+	watcher := eventlog.NewWatcher()
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	// Initial immediate security log poll on startup
+	go dispatchSecurityEvents(cfg.AgentID, watcher, wsClient)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[*] [SecurityEvent] Context cancelled. Terminating event log loop.")
+			return
+		case <-ticker.C:
+			go dispatchSecurityEvents(cfg.AgentID, watcher, wsClient)
+		}
+	}
+}
+
+func dispatchSecurityEvents(agentID string, watcher *eventlog.Watcher, wsClient *ws.Client) {
+	events, err := watcher.ReadSecurityEvents(10)
+	if err != nil {
+		log.Printf("[-] [SecurityEvent] Event log read error: %v", err)
+		return
+	}
+
+	if len(events) == 0 {
+		return
+	}
+
+	frame := eventlog.BuildSecurityEventFrame(agentID, events)
+	payload, err := json.Marshal(frame)
+	if err != nil {
+		log.Printf("[-] [SecurityEvent] Serialization failure: %v", err)
+		return
+	}
+
+	if queued := wsClient.Send(payload); queued {
+		log.Printf("[+] [SecurityEvent] Critical security events dispatched (%d events, Payload: %d bytes)", len(events), len(payload))
+	} else {
+		log.Printf("[-] [SecurityEvent] Outbound buffer saturated; dropped event frame for Agent [%s]", agentID)
 	}
 }
