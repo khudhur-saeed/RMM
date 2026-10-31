@@ -10,6 +10,7 @@ import (
 
 	"tactical-rmm/agent/internal/client"
 	"tactical-rmm/agent/internal/config"
+	"tactical-rmm/agent/internal/netstat"
 	"tactical-rmm/agent/internal/service"
 	"tactical-rmm/agent/internal/system"
 	"tactical-rmm/agent/internal/telemetry"
@@ -166,6 +167,9 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 	// Launch Comprehensive Hardware Telemetry Loop (every 60 seconds) in background
 	go runHardwareTelemetryLoop(ctx, agentCfg, wsClient)
 
+	// Launch Network Socket Inspection Loop (every 30 seconds) in background
+	go runNetworkTelemetryLoop(ctx, agentCfg, wsClient)
+
 	// Run Heartbeat Loop (every 30 seconds) and block until context is cancelled
 	runHeartbeatLoop(ctx, agentCfg, wsClient)
 
@@ -246,5 +250,46 @@ func runHardwareTelemetryLoop(ctx context.Context, cfg *config.AgentConfig, wsCl
 				log.Printf("[-] [HardwareTelemetry] Outbound buffer saturated; dropped frame for Agent [%s]", cfg.AgentID)
 			}
 		}
+	}
+}
+
+func runNetworkTelemetryLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
+	inspector := netstat.NewInspector()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// Initial immediate socket inspection on startup
+	dispatchNetworkSnapshot(cfg.AgentID, inspector, wsClient)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[*] [Netstat] Context cancelled. Terminating network telemetry loop.")
+			return
+		case <-ticker.C:
+			dispatchNetworkSnapshot(cfg.AgentID, inspector, wsClient)
+		}
+	}
+}
+
+func dispatchNetworkSnapshot(agentID string, inspector netstat.Inspector, wsClient *ws.Client) {
+	sockets, err := inspector.GetActiveSockets()
+	if err != nil {
+		log.Printf("[-] [Netstat] Socket inspection fault: %v", err)
+		return
+	}
+
+	snapshot := netstat.BuildSnapshot(agentID, sockets)
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		log.Printf("[-] [Netstat] JSON serialization failure: %v", err)
+		return
+	}
+
+	if queued := wsClient.Send(payload); queued {
+		log.Printf("[+] [Netstat] Sockets queued (%d active listeners & established connections, Payload: %d bytes)",
+			len(sockets), len(payload))
+	} else {
+		log.Printf("[-] [Netstat] Outbound buffer saturated; dropped network frame for Agent [%s]", agentID)
 	}
 }
