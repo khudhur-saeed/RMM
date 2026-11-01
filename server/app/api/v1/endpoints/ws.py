@@ -5,17 +5,85 @@ import secrets
 from datetime import datetime, timezone
 from uuid import UUID
 
+from app.core.ws_manager import ws_manager
+from app.db.session import get_db
+from app.models.agent import Agent
+from app.schemas.telemetry import (
+    AuthEventPayload,
+    HardwareMetricsPayload,
+    ServiceStatusPayload,
+)
+from app.services.alert_engine import alert_evaluator
 from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect, status
+from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.db.session import get_db
-from app.core.ws_manager import ws_manager
-from app.models.agent import Agent
 
 logger = logging.getLogger("rmm.websocket")
 
 router = APIRouter()
+
+
+async def process_telemetry_frame(agent_id: UUID, payload: dict) -> None:
+    """
+    Evaluates inbound telemetry frames against the alert engine without interrupting the socket.
+    """
+    try:
+        frame_type = payload.get("type")
+
+        if frame_type == "hardware_telemetry":
+            cpu_val = payload.get("cpu", {}).get(
+                "usage_percent", payload.get("cpu_percent", 0.0)
+            )
+            mem_val = payload.get("memory", {}).get(
+                "used_percent", payload.get("memory_percent", 0.0)
+            )
+            hw_payload = HardwareMetricsPayload(
+                cpu_percent=cpu_val, memory_percent=mem_val
+            )
+            alerts = alert_evaluator.evaluate_hardware(agent_id, hw_payload)
+            for alert in alerts:
+                logger.warning(
+                    f"[ALERT GENERATED] [{alert.severity.value}] Agent {alert.agent_id} | "
+                    f"Category: {alert.category.value} | Title: {alert.title} | {alert.message}"
+                )
+
+        elif frame_type == "service_status":
+            svc_payload = ServiceStatusPayload(**payload.get("payload", payload))
+            alerts = alert_evaluator.evaluate_services(agent_id, svc_payload)
+            for alert in alerts:
+                logger.error(
+                    f"[ALERT GENERATED] [{alert.severity.value}] Agent {alert.agent_id} | "
+                    f"Category: {alert.category.value} | Title: {alert.title} | {alert.message}"
+                )
+
+        elif frame_type in ("auth_event", "security_event_telemetry"):
+            events = payload.get("events", [payload.get("payload", payload)])
+            for ev in events:
+                event_type = ev.get("event_type") or (
+                    "LOGON_FAILED_4625" if ev.get("event_id") == 4625 else "OTHER"
+                )
+                user = ev.get("user") or ev.get("target_user_name") or "unknown"
+                src_ip = ev.get("source_ip") or ev.get("ip_address")
+
+                auth_payload = AuthEventPayload(
+                    event_type=event_type,
+                    username=user,
+                    source_ip=src_ip,
+                )
+                alerts = alert_evaluator.evaluate_auth_event(agent_id, auth_payload)
+                for alert in alerts:
+                    logger.error(
+                        f"[ALERT GENERATED] [{alert.severity.value}] Agent {alert.agent_id} | "
+                        f"Category: {alert.category.value} | Title: {alert.title} | {alert.message}"
+                    )
+
+    except ValidationError as err:
+        logger.debug(f"Telemetry frame schema mismatch from agent {agent_id}: {err}")
+    except Exception as exc:
+        logger.warning(
+            f"Unexpected error evaluating telemetry frame from agent {agent_id}: {exc}"
+        )
 
 
 @router.websocket("/agent/{agent_id}")
@@ -25,7 +93,7 @@ async def agent_websocket_endpoint(
     token: str = Query(...),
     db: AsyncSession = Depends(get_db),
 ):
-    # 1. المصادقة الصارمة للعميل أثناء المصافحة
+
     query = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = query.scalar_one_or_none()
 
@@ -38,10 +106,8 @@ async def agent_websocket_endpoint(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    # 2. تسجيل الاتصال في مدير المقابس ومزامنة الحالة مع Redis
     await ws_manager.connect(agent_id, websocket)
 
-    # 3. تحديث last_seen فور نجاح الاتصال
     await db.execute(
         update(Agent)
         .where(Agent.id == agent_id)
@@ -54,8 +120,9 @@ async def agent_websocket_endpoint(
         while True:
             data = await websocket.receive_text()
 
-            # تجديد الـ TTL في Redis وتحديث last_seen في PostgreSQL مع كل إطار
-            await ws_manager.redis_client.set(name=f"agent:{agent_id}:status", value="online", ex=60)
+            await ws_manager.redis_client.set(
+                name=f"agent:{agent_id}:status", value="online", ex=60
+            )
             await db.execute(
                 update(Agent)
                 .where(Agent.id == agent_id)
@@ -67,10 +134,11 @@ async def agent_websocket_endpoint(
                 payload = json.loads(data)
                 msg_type = payload.get("type")
 
-                # تمرير مخرجات الطرفية للمشغل إن وجدت
                 if msg_type == "term_out":
                     term_data = payload.get("payload", "")
                     await ws_manager.route_to_operator(agent_id, term_data)
+
+                await process_telemetry_frame(agent_id, payload)
 
             except json.JSONDecodeError:
                 pass
@@ -93,10 +161,12 @@ async def operator_websocket_endpoint(
     try:
         while True:
             raw_keystroke = await websocket.receive_text()
-            frame = json.dumps({
-                "type": "term_in",
-                "payload": raw_keystroke,
-            })
+            frame = json.dumps(
+                {
+                    "type": "term_in",
+                    "payload": raw_keystroke,
+                }
+            )
             await ws_manager.route_to_agent(agent_id, frame)
     except WebSocketDisconnect:
         pass
