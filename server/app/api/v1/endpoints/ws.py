@@ -9,13 +9,14 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from pydantic import ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import _extract_bearer_token, verify_operator_ws_credentials
 from app.core.ws_manager import ws_manager
 from app.db.session import async_session_factory
 from app.models.agent import Agent
+from app.models.software import InstalledSoftware
 from app.schemas.task import TaskExitFrame, TaskStreamFrame
 from app.schemas.telemetry import (
     AuthEventPayload,
@@ -43,11 +44,62 @@ async def _update_agent_last_seen(agent_id: UUID) -> None:
         await db.commit()
 
 
+async def _persist_software_inventory(
+    agent_id: UUID,
+    software_list: list[dict[str, Any]],
+    session: AsyncSession,
+) -> int:
+    """Atomically replaces the agent's installed software catalog inside PostgreSQL."""
+    seen: set[tuple[str, str]] = set()
+    records: list[InstalledSoftware] = []
+
+    for pkg in software_list:
+        if not isinstance(pkg, dict):
+            continue
+        raw_name = str(pkg.get("name") or "").strip()
+        if not raw_name:
+            continue
+
+        name = raw_name[:255]
+        version_raw = str(pkg.get("version") or "").strip()
+        version = version_raw[:128] if version_raw else None
+
+        publisher_raw = str(pkg.get("publisher") or "").strip()
+        publisher = publisher_raw[:255] if publisher_raw else None
+
+        install_date_raw = str(pkg.get("install_date") or "").strip()
+        install_date = install_date_raw[:64] if install_date_raw else None
+
+        dedup_key = (name.lower(), (version or "").lower())
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        records.append(
+            InstalledSoftware(
+                agent_id=agent_id,
+                name=name,
+                version=version,
+                publisher=publisher,
+                install_date=install_date,
+            )
+        )
+
+    await session.execute(
+        delete(InstalledSoftware).where(InstalledSoftware.agent_id == agent_id)
+    )
+    if records:
+        session.add_all(records)
+    await session.commit()
+    return len(records)
+
+
 async def handle_software_inventory(
     agent_id: UUID, payload: Dict[str, Any], db: Optional[AsyncSession] = None
-) -> None:
+) -> int:
     """
-    Processes incoming installed software inventory frames from the agent.
+    Processes incoming installed software inventory frames from the agent
+    and synchronizes the full package catalog into PostgreSQL.
     """
     try:
         software_list = payload.get("software", [])
@@ -56,25 +108,22 @@ async def handle_software_inventory(
                 "[-] [SoftwareInventory] Malformed payload received for Agent [%s]",
                 agent_id,
             )
-            return
+            return 0
+
+        if db is not None:
+            stored_count = await _persist_software_inventory(agent_id, software_list, db)
+        else:
+            async with async_session_factory() as session:
+                stored_count = await _persist_software_inventory(
+                    agent_id, software_list, session
+                )
 
         logger.info(
-            "[+] [SoftwareInventory] Received %d installed packages from Agent [%s]",
-            len(software_list),
+            "[+] [SoftwareInventory] Synchronized %d installed packages for Agent [%s]",
+            stored_count,
             agent_id,
         )
-
-        # Forensic sample inspection for the first few packages
-        for pkg in software_list[:5]:
-            name = pkg.get("name", "Unknown")
-            version = pkg.get("version", "N/A")
-            publisher = pkg.get("publisher", "Unknown")
-            logger.debug(
-                "    * Package: %s (Version: %s, Publisher: %s)",
-                name,
-                version,
-                publisher,
-            )
+        return stored_count
 
     except Exception as exc:
         logger.warning(
@@ -82,6 +131,7 @@ async def handle_software_inventory(
             agent_id,
             exc,
         )
+        return 0
 
 
 async def process_telemetry_frame(agent_id: UUID, payload: dict) -> None:

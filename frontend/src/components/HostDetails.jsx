@@ -5,6 +5,7 @@ import { FitAddon } from "xterm-addon-fit";
 import "xterm/css/xterm.css";
 
 import AlertCenter from "./AlertCenter";
+import SoftwareInventory from "./SoftwareInventory";
 import TelemetryCharts from "./TelemetryCharts";
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -298,7 +299,12 @@ export default function HostDetails({ operatorToken }) {
       {/* 3. مخططات القياسات اللحظية عبر Recharts */}
       <TelemetryCharts data={telemetryData} />
 
-      {/* 4. مساحة عمل الطرفية التفاعلية */}
+      {/* 4. جرد البرمجيات المثبتة والبحث اللحظي */}
+      {isValidUUID && (
+        <SoftwareInventory agentId={id} operatorToken={operatorToken} />
+      )}
+
+      {/* 5. مساحة عمل الطرفية التفاعلية */}
       <div
         style={{
           display: "flex",

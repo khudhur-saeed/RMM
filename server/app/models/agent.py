@@ -11,6 +11,7 @@ from app.db.base import Base
 
 if TYPE_CHECKING:
     from app.models.site import Site
+    from app.models.software import InstalledSoftware
 
 
 class Agent(Base):
@@ -68,4 +69,9 @@ class Agent(Base):
     site: Mapped["Site"] = relationship(
         "Site",
         back_populates="agents",
+    )
+    installed_software: Mapped[List["InstalledSoftware"]] = relationship(
+        "InstalledSoftware",
+        back_populates="agent",
+        cascade="all, delete-orphan",
     )

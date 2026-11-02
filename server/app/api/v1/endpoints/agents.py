@@ -1,16 +1,18 @@
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import verify_agent_api_key, verify_operator_token
 from app.core.ws_manager import ws_manager
 from app.db.session import get_db
 from app.models.agent import Agent
+from app.models.software import InstalledSoftware
 from app.schemas.agent import AgentHeartbeat, AgentRead
+from app.schemas.software import SoftwareRead
 from app.schemas.task import TaskDispatchFrame
 
 router = APIRouter()
@@ -54,6 +56,52 @@ async def get_agent(
             detail="Agent not found.",
         )
     return agent
+
+
+@router.get(
+    "/{agent_id}/software",
+    response_model=List[SoftwareRead],
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(verify_operator_token)],
+    summary="List and search installed software packages for an agent",
+)
+async def get_agent_software(
+    agent_id: UUID,
+    search: Optional[str] = Query(
+        default=None,
+        description="Case-insensitive filter matching package name, publisher, or version",
+    ),
+    limit: int = Query(default=500, ge=1, le=5000),
+    offset: int = Query(default=0, ge=0),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Retrieves the synchronized software inventory for a monitored endpoint,
+    supporting real-time substring search across name, publisher, and version.
+    """
+    agent_stmt = select(Agent.id).where(Agent.id == agent_id)
+    agent_exists = (await db.execute(agent_stmt)).scalar_one_or_none()
+    if not agent_exists:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found.",
+        )
+
+    stmt = select(InstalledSoftware).where(InstalledSoftware.agent_id == agent_id)
+
+    if search and search.strip():
+        pattern = f"%{search.strip()}%"
+        stmt = stmt.where(
+            or_(
+                InstalledSoftware.name.ilike(pattern),
+                InstalledSoftware.publisher.ilike(pattern),
+                InstalledSoftware.version.ilike(pattern),
+            )
+        )
+
+    stmt = stmt.order_by(InstalledSoftware.name.asc()).offset(offset).limit(limit)
+    result = await db.execute(stmt)
+    return result.scalars().all()
 
 
 @router.get(
