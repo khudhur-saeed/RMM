@@ -13,6 +13,7 @@ import (
 	"tactical-rmm/agent/internal/config"
 	"tactical-rmm/agent/internal/eventlog"
 	"tactical-rmm/agent/internal/fim"
+	"tactical-rmm/agent/internal/inventory"
 	"tactical-rmm/agent/internal/netstat"
 	"tactical-rmm/agent/internal/process"
 	"tactical-rmm/agent/internal/service"
@@ -165,28 +166,19 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 		return fmt.Errorf("failed to initialize WebSocket client: %w", err)
 	}
 
-	// Launch WebSocket tunnel supervisor asynchronously
+	// 1. Launch WebSocket tunnel supervisor asynchronously
 	go wsClient.Run(ctx)
 
-	// Launch Comprehensive Hardware Telemetry Loop (every 60 seconds) in background
+	// 2. Launch Background Collector Loops
 	go runHardwareTelemetryLoop(ctx, agentCfg, wsClient)
-
-	// Launch Network Socket Inspection Loop (every 30 seconds) in background
 	go runNetworkTelemetryLoop(ctx, agentCfg, wsClient)
-
-	// Launch Process Monitoring Loop (every 60 seconds) in background
 	go runProcessTelemetryLoop(ctx, agentCfg, wsClient)
-
-	// Launch Windows Security Event Log Reader (every 15 seconds) in background
 	go runSecurityEventLoop(ctx, agentCfg, wsClient)
-
-	// Launch Linux Authentication Monitor Loop (every 5 seconds) in background (Day 33)
 	go runAuthMonitorLoop(ctx, agentCfg, wsClient)
-
-	// Launch Linux File Integrity Monitoring Loop (every 60 seconds) in background (Day 33)
 	go runFIMLoop(ctx, agentCfg, wsClient)
+	go runSoftwareInventoryLoop(ctx, agentCfg, wsClient)
 
-	// Run Heartbeat Loop (every 30 seconds) and block until context is cancelled
+	// 3. Run Heartbeat Loop (every 30 seconds) and block until cancellation
 	runHeartbeatLoop(ctx, agentCfg, wsClient)
 
 	return nil
@@ -391,7 +383,6 @@ func dispatchSecurityEvents(agentID string, watcher *eventlog.Watcher, wsClient 
 	}
 }
 
-// runAuthMonitorLoop inspects Linux auth.log every 5 seconds and dispatches detected events upstream (Day 33).
 func runAuthMonitorLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
 	watcher := authmon.NewWatcher()
 	ticker := time.NewTicker(5 * time.Second)
@@ -429,7 +420,6 @@ func runAuthMonitorLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *
 	}
 }
 
-// runFIMLoop evaluates cryptographic SHA-256 drift across monitored paths every 60 seconds (Day 33).
 func runFIMLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
 	scanner := fim.NewScanner(nil)
 	scanner.InitializeBaseline()
@@ -462,5 +452,51 @@ func runFIMLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Clien
 				log.Printf("[-] [FIM] Outbound buffer saturated; dropped frame for Agent [%s]", cfg.AgentID)
 			}
 		}
+	}
+}
+
+func runSoftwareInventoryLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
+	ticker := time.NewTicker(600 * time.Second)
+	defer ticker.Stop()
+
+	// Initial immediate software inventory scrape on startup
+	go dispatchSoftwareInventory(cfg.AgentID, wsClient)
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[*] [SoftwareInventory] Context cancelled. Terminating inventory loop.")
+			return
+		case <-ticker.C:
+			go dispatchSoftwareInventory(cfg.AgentID, wsClient)
+		}
+	}
+}
+
+func dispatchSoftwareInventory(agentID string, wsClient *ws.Client) {
+	softwareList, err := inventory.ExtractInstalledSoftware()
+	if err != nil {
+		log.Printf("[-] [SoftwareInventory] Extraction failure: %v", err)
+		return
+	}
+
+	frame := inventory.SoftwareInventoryFrame{
+		Type:      "software_inventory",
+		AgentID:   agentID,
+		Timestamp: time.Now().Unix(),
+		Software:  softwareList,
+	}
+
+	payload, err := json.Marshal(frame)
+	if err != nil {
+		log.Printf("[-] [SoftwareInventory] Serialization error: %v", err)
+		return
+	}
+
+	if queued := wsClient.Send(payload); queued {
+		log.Printf("[+] [SoftwareInventory] Inventory queued (%d installed packages, Payload: %d bytes)",
+			len(softwareList), len(payload))
+	} else {
+		log.Printf("[-] [SoftwareInventory] Outbound buffer saturated; dropped frame for Agent [%s]", agentID)
 	}
 }

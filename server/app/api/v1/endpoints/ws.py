@@ -3,6 +3,7 @@ import json
 import logging
 import secrets
 from datetime import datetime, timezone
+from typing import Any, Dict
 from uuid import UUID
 
 from app.core.ws_manager import ws_manager
@@ -22,6 +23,47 @@ from sqlalchemy.ext.asyncio import AsyncSession
 logger = logging.getLogger("rmm.websocket")
 
 router = APIRouter()
+
+
+async def handle_software_inventory(
+    agent_id: UUID, payload: Dict[str, Any], db: AsyncSession
+) -> None:
+    """
+    Processes incoming installed software inventory frames from the agent.
+    """
+    try:
+        software_list = payload.get("software", [])
+        if not isinstance(software_list, list):
+            logger.warning(
+                "[-] [SoftwareInventory] Malformed payload received for Agent [%s]",
+                agent_id,
+            )
+            return
+
+        logger.info(
+            "[+] [SoftwareInventory] Received %d installed packages from Agent [%s]",
+            len(software_list),
+            agent_id,
+        )
+
+        # Forensic sample inspection for the first few packages
+        for pkg in software_list[:5]:
+            name = pkg.get("name", "Unknown")
+            version = pkg.get("version", "N/A")
+            publisher = pkg.get("publisher", "Unknown")
+            logger.debug(
+                "    * Package: %s (Version: %s, Publisher: %s)",
+                name,
+                version,
+                publisher,
+            )
+
+    except Exception as exc:
+        logger.warning(
+            "Unexpected error evaluating software inventory from agent %s: %s",
+            agent_id,
+            exc,
+        )
 
 
 async def process_telemetry_frame(agent_id: UUID, payload: dict) -> None:
@@ -93,7 +135,6 @@ async def agent_websocket_endpoint(
     token: str = Query(...),
     db: AsyncSession = Depends(get_db),
 ):
-
     query = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent = query.scalar_one_or_none()
 
@@ -138,7 +179,11 @@ async def agent_websocket_endpoint(
                     term_data = payload.get("payload", "")
                     await ws_manager.route_to_operator(agent_id, term_data)
 
-                await process_telemetry_frame(agent_id, payload)
+                elif msg_type == "software_inventory":
+                    await handle_software_inventory(agent_id, payload, db)
+
+                else:
+                    await process_telemetry_frame(agent_id, payload)
 
             except json.JSONDecodeError:
                 pass
