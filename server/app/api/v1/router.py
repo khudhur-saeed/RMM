@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import agents, enroll, health, organizations, sites, tokens, ws
+from app.api.v1.endpoints import agents, enroll, health, organizations, scripts, sites, tokens, ws
 
 api_v1_router = APIRouter()
 
@@ -39,6 +39,13 @@ api_v1_router.include_router(
     agents.router,
     prefix="/agents",
     tags=["Agents"],
+)
+
+# Script Keystore & Parameterized Task Templates
+api_v1_router.include_router(
+    scripts.router,
+    prefix="/scripts",
+    tags=["Script Keystore"],
 )
 
 # Real-Time Full-Duplex Command & Telemetry Tunnels
