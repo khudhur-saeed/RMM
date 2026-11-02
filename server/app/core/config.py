@@ -1,5 +1,6 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
+from typing import Optional
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     """
@@ -19,6 +20,10 @@ class Settings(BaseSettings):
     # Redis Configuration
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
+    REDIS_PASSWORD: Optional[str] = None
+
+    # Control Plane Operator Authentication
+    ADMIN_API_TOKEN: str = "rmm_admin_dev_token_2026"
 
     @property
     def async_database_url(self) -> str:

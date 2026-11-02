@@ -18,7 +18,7 @@ func ExecuteStreaming(ctx context.Context, command string, onChunk StreamCallbac
 	}
 
 	startTime := time.Now()
-	cmd := prepareStreamingCmd(ctx, command)
+	cmd := prepareStreamingCmd(command)
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -33,6 +33,22 @@ func ExecuteStreaming(ctx context.Context, command string, onChunk StreamCallbac
 	if err := cmd.Start(); err != nil {
 		return -1, 0, err
 	}
+
+	killDone := make(chan struct{})
+	defer close(killDone)
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			if cmd.Process != nil {
+				terminateStreamingProcessTree(cmd.Process.Pid)
+			}
+			_ = stdoutPipe.Close()
+			_ = stderrPipe.Close()
+		case <-killDone:
+			return
+		}
+	}()
 
 	stdoutDone := make(chan struct{}, 1)
 	stderrDone := make(chan struct{}, 1)

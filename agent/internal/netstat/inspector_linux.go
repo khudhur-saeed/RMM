@@ -32,12 +32,18 @@ func (li *LinuxInspector) GetActiveSockets() ([]SocketEntry, error) {
 
 	var entries []SocketEntry
 
-	// Parse IPv4 tables
+	// Parse IPv4 & IPv6 tables
 	tcpEntries, _ := parseProcNetFile("/proc/net/tcp", ProtocolTCP, inodeMap)
 	entries = append(entries, tcpEntries...)
 
+	tcp6Entries, _ := parseProcNetFile("/proc/net/tcp6", ProtocolTCP, inodeMap)
+	entries = append(entries, tcp6Entries...)
+
 	udpEntries, _ := parseProcNetFile("/proc/net/udp", ProtocolUDP, inodeMap)
 	entries = append(entries, udpEntries...)
+
+	udp6Entries, _ := parseProcNetFile("/proc/net/udp6", ProtocolUDP, inodeMap)
+	entries = append(entries, udp6Entries...)
 
 	return entries, nil
 }
@@ -165,7 +171,7 @@ func parseProcNetFile(filePath string, proto TransportProtocol, inodeMap map[uin
 	return results, scanner.Err()
 }
 
-// parseHexEndPoint decodes "0100007F:0050" into IP "127.0.0.1" and Port 80.
+// parseHexEndPoint decodes IPv4 ("0100007F:0050") or IPv6 (32-hex-char) endpoints from /proc/net/*.
 func parseHexEndPoint(hexEP string) (IPEndPoint, error) {
 	parts := strings.Split(hexEP, ":")
 	if len(parts) != 2 {
@@ -173,12 +179,26 @@ func parseHexEndPoint(hexEP string) (IPEndPoint, error) {
 	}
 
 	ipBytes, err := hex.DecodeString(parts[0])
-	if err != nil || len(ipBytes) != 4 {
+	if err != nil || (len(ipBytes) != 4 && len(ipBytes) != 16) {
 		return IPEndPoint{}, fmt.Errorf("invalid hex IP payload")
 	}
 
-	// IPv4 in /proc/net is stored in Little-Endian byte order
-	ip := net.IPv4(ipBytes[3], ipBytes[2], ipBytes[1], ipBytes[0]).String()
+	var ip string
+	if len(ipBytes) == 4 {
+		// IPv4 in /proc/net is stored in Little-Endian byte order
+		ip = net.IPv4(ipBytes[3], ipBytes[2], ipBytes[1], ipBytes[0]).String()
+	} else {
+		// IPv6 in /proc/net/tcp6 is stored as four 32-bit Little-Endian words
+		ipv6 := make(net.IP, 16)
+		for w := 0; w < 4; w++ {
+			base := w * 4
+			ipv6[base] = ipBytes[base+3]
+			ipv6[base+1] = ipBytes[base+2]
+			ipv6[base+2] = ipBytes[base+1]
+			ipv6[base+3] = ipBytes[base]
+		}
+		ip = ipv6.String()
+	}
 
 	portVal, err := strconv.ParseUint(parts[1], 16, 16)
 	if err != nil {

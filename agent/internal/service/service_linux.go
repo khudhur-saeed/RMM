@@ -23,10 +23,11 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart={{.BinaryPath}}
+ExecStart="{{.BinaryPath}}"
 Restart=always
 RestartSec=5s
 WorkingDirectory=/var/lib/rmmagent
+StateDirectory=rmmagent
 LimitNOFILE=65535
 StandardOutput=journal
 StandardError=journal
@@ -74,6 +75,10 @@ func (m *linuxManager) Install() error {
 	unitPath := fmt.Sprintf("/etc/systemd/system/%s.service", m.name)
 	if _, err := os.Stat(unitPath); err == nil {
 		return ErrServiceAlreadyInstalled
+	}
+
+	if err := os.MkdirAll("/var/lib/rmmagent", 0700); err != nil {
+		return fmt.Errorf("failed to create agent state directory /var/lib/rmmagent: %w", err)
 	}
 
 	file, err := os.OpenFile(unitPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)

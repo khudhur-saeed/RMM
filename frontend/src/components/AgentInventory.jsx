@@ -1,28 +1,40 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 
-export default function AgentInventory() {
+export default function AgentInventory({ operatorToken }) {
   // 1. تعريف مخازن الحالة (State Managers)
   const [agents, setAgents] = useState([]);
   const [error, setError] = useState(null);
 
   // 2. التأثير الجانبي لجلب البيانات عند تحميل المكون
   useEffect(() => {
+    const controller = new AbortController();
+    const activeToken = operatorToken || sessionStorage.getItem('rmm_operator_token') || 'rmm_admin_dev_token_2026';
+
     const fetchAgents = async () => {
       try {
         // يتم توجيه هذا الطلب تلقائياً إلى المنفذ 8000 بفضل الوكيل العكسي (Proxy)
-        const response = await fetch('/api/v1/agents');
+        const response = await fetch('/api/v1/agents', {
+          headers: {
+            Authorization: `Bearer ${activeToken}`,
+          },
+          signal: controller.signal,
+        });
         if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
         
         const data = await response.json();
         setAgents(data); // تحديث الواجهة بالمصفوفة المستلمة
+        setError(null);
       } catch (err) {
-        setError(err.message);
+        if (err.name !== 'AbortError') {
+          setError(err.message);
+        }
       }
     };
 
     fetchAgents();
-  }, []); // المصفوفة الفارغة تعني: "نفّذ هذا الكود مرة واحدة فقط عند فتح الشاشة"
+    return () => controller.abort();
+  }, [operatorToken]);
 
   // 3. رسم واجهة المستخدم (JSX)
   return (

@@ -2,13 +2,15 @@ from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import verify_operator_token
 from app.db.session import get_db
 from app.models.organization import Organization
 from app.schemas.organization import OrganizationCreate, OrganizationRead
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(verify_operator_token)])
 
 
 @router.post(
@@ -39,7 +41,14 @@ async def create_organization(
     # 2. Instantiate and persist new ORM entity
     new_org = Organization(name=payload.name)
     db.add(new_org)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Organization with name '{payload.name}' already exists.",
+        )
     await db.refresh(new_org)
 
     return new_org

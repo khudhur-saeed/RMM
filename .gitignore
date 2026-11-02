@@ -8,6 +8,8 @@
 # Go Endpoint Agent
 agent/bin/
 agent/dist/
+agent/build/
+agent/rmmagent
 *.exe
 *.dll
 *.so
@@ -19,6 +21,7 @@ server/*/__pycache__/
 *.py[cod]
 *$py.class
 server/.venv/
+server/env/
 .venv/
 server/alembic/versions/*_temp.py
 

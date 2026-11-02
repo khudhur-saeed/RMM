@@ -33,3 +33,29 @@ async def test_direct_ws_manager_redis_lifecycle():
     assert registry_key not in ws_manager.active_connections
     status_post_disconnect = await ws_manager.redis_client.get(redis_key)
     assert status_post_disconnect is None
+
+
+@pytest.mark.asyncio
+async def test_ws_manager_superseded_socket_race_protection():
+    """
+    Verifies that a stale socket's delayed disconnect cleanup does not
+    evict a newly connected replacement socket or delete its Redis status key.
+    """
+    agent_id = uuid.uuid4()
+    registry_key = str(agent_id).lower()
+    stale_socket = AsyncMock()
+    live_socket = AsyncMock()
+    redis_key = f"agent:{registry_key}:status"
+
+    await ws_manager.connect(agent_id, stale_socket)
+    await ws_manager.connect(agent_id, live_socket)
+
+    # Stale socket's finally block runs after live_socket has already replaced it
+    await ws_manager.disconnect(agent_id, websocket=stale_socket)
+
+    assert ws_manager.active_connections.get(registry_key) is live_socket
+    assert await ws_manager.redis_client.get(redis_key) == "online"
+
+    # Cleanup live socket
+    await ws_manager.disconnect(agent_id, websocket=live_socket)
+    assert registry_key not in ws_manager.active_connections

@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"sync"
 
 	"github.com/creack/pty"
@@ -15,6 +16,7 @@ import (
 type Session struct {
 	cmd  *exec.Cmd
 	ptmx *os.File
+	done chan struct{}
 	once sync.Once
 }
 
@@ -24,9 +26,23 @@ type OutboundMessage struct {
 	Payload string `json:"payload"`
 }
 
+func resolveInteractiveShell() string {
+	if runtime.GOOS == "windows" {
+		if path, err := exec.LookPath("powershell.exe"); err == nil {
+			return path
+		}
+		return "cmd.exe"
+	}
+	if path, err := exec.LookPath("/bin/bash"); err == nil {
+		return path
+	}
+	return "/bin/sh"
+}
+
 // NewSession spawns an interactive shell inside a newly allocated PTY.
 func NewSession() (*Session, error) {
-	cmd := exec.Command("/bin/bash", "-i")
+	shellPath := resolveInteractiveShell()
+	cmd := exec.Command(shellPath, "-i")
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
 	ptmx, err := pty.Start(cmd)
@@ -37,6 +53,7 @@ func NewSession() (*Session, error) {
 	return &Session{
 		cmd:  cmd,
 		ptmx: ptmx,
+		done: make(chan struct{}),
 	}, nil
 }
 
@@ -63,7 +80,11 @@ func (s *Session) StartOutputPump(outboundChan chan<- []byte) {
 
 				payloadBytes, err := json.Marshal(msg)
 				if err == nil {
-					outboundChan <- payloadBytes
+					select {
+					case outboundChan <- payloadBytes:
+					case <-s.done:
+						return
+					}
 				}
 			}
 		}
@@ -79,6 +100,7 @@ func (s *Session) WriteInput(data []byte) error {
 // Close ensures deterministic cleanup of both the PTY file handle and child process.
 func (s *Session) Close() {
 	s.once.Do(func() {
+		close(s.done)
 		if s.ptmx != nil {
 			_ = s.ptmx.Close()
 		}

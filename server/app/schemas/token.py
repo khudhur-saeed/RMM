@@ -26,9 +26,20 @@ class EnrollmentTokenCreate(EnrollmentTokenBase):
 
 
 class EnrollmentTokenRead(EnrollmentTokenBase):
-    """Outbound serialization schema returned upon token generation."""
+    """Outbound serialization schema returned strictly once upon token generation."""
     id: UUID
     token: str
+    is_used: bool = False
+    expires_at: datetime
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class EnrollmentTokenPublic(EnrollmentTokenBase):
+    """Redacted outbound schema for listing enrollment tokens without exposing raw secrets."""
+    id: UUID
+    is_used: bool
     expires_at: datetime
     created_at: datetime
 

@@ -2,31 +2,49 @@ import hashlib
 import json
 import logging
 import secrets
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from uuid import UUID
 
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
+from pydantic import ValidationError
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.security import _extract_bearer_token, verify_operator_ws_credentials
 from app.core.ws_manager import ws_manager
-from app.db.session import get_db
+from app.db.session import async_session_factory
 from app.models.agent import Agent
+from app.schemas.task import TaskExitFrame, TaskStreamFrame
 from app.schemas.telemetry import (
     AuthEventPayload,
     HardwareMetricsPayload,
     ServiceStatusPayload,
 )
 from app.services.alert_engine import alert_evaluator
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect, status
-from pydantic import ValidationError
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger("rmm.websocket")
 
 router = APIRouter()
 
+# Minimum interval (in seconds) between PostgreSQL last_seen writes per connected agent
+DB_LAST_SEEN_SYNC_INTERVAL_SEC = 30.0
+
+
+async def _update_agent_last_seen(agent_id: UUID) -> None:
+    """Updates the agent's last_seen timestamp using a short-lived DB session."""
+    async with async_session_factory() as db:
+        await db.execute(
+            update(Agent)
+            .where(Agent.id == agent_id)
+            .values(last_seen=datetime.now(timezone.utc))
+        )
+        await db.commit()
+
 
 async def handle_software_inventory(
-    agent_id: UUID, payload: Dict[str, Any], db: AsyncSession
+    agent_id: UUID, payload: Dict[str, Any], db: Optional[AsyncSession] = None
 ) -> None:
     """
     Processes incoming installed software inventory frames from the agent.
@@ -132,73 +150,121 @@ async def process_telemetry_frame(agent_id: UUID, payload: dict) -> None:
 async def agent_websocket_endpoint(
     websocket: WebSocket,
     agent_id: UUID,
-    token: str = Query(...),
-    db: AsyncSession = Depends(get_db),
+    token: Optional[str] = Query(default=None),
 ):
-    query = await db.execute(select(Agent).where(Agent.id == agent_id))
-    agent = query.scalar_one_or_none()
+    # 1. Extract token from Authorization header (preferred) or query parameter fallback
+    raw_token = _extract_bearer_token(
+        websocket.headers.get("authorization"),
+        websocket.headers.get("x-api-key"),
+    ) or token
 
-    if not agent or not agent.api_key_hash:
+    if not raw_token:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    if not secrets.compare_digest(token_hash, agent.api_key_hash):
+    # 2. Authenticate agent using a short-lived DB session (avoids pinning pool connections)
+    async with async_session_factory() as db:
+        query = await db.execute(select(Agent).where(Agent.id == agent_id))
+        agent = query.scalar_one_or_none()
+        api_key_hash = agent.api_key_hash if agent else None
+
+    if not api_key_hash:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    if not secrets.compare_digest(token_hash, api_key_hash):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    # 3. Register connection in ConnectionManager and sync online status in Redis
     await ws_manager.connect(agent_id, websocket)
 
-    await db.execute(
-        update(Agent)
-        .where(Agent.id == agent_id)
-        .values(last_seen=datetime.now(timezone.utc))
-    )
-    await db.commit()
+    # 4. Update last_seen immediately upon connection
+    await _update_agent_last_seen(agent_id)
+    last_db_sync = time.monotonic()
     logger.info("Agent [%s] connected and last_seen updated in PostgreSQL.", agent_id)
+
+    canonical_key = str(agent_id).lower()
 
     try:
         while True:
             data = await websocket.receive_text()
 
+            # Refresh Redis online TTL on every frame
             await ws_manager.redis_client.set(
-                name=f"agent:{agent_id}:status", value="online", ex=60
+                name=f"agent:{canonical_key}:status",
+                value="online",
+                ex=60,
             )
-            await db.execute(
-                update(Agent)
-                .where(Agent.id == agent_id)
-                .values(last_seen=datetime.now(timezone.utc))
-            )
-            await db.commit()
 
+            msg_type: Optional[str] = None
+            payload: Optional[dict] = None
             try:
-                payload = json.loads(data)
-                msg_type = payload.get("type")
-
-                if msg_type == "term_out":
-                    term_data = payload.get("payload", "")
-                    await ws_manager.route_to_operator(agent_id, term_data)
-
-                elif msg_type == "software_inventory":
-                    await handle_software_inventory(agent_id, payload, db)
-
-                else:
-                    await process_telemetry_frame(agent_id, payload)
-
+                parsed = json.loads(data)
+                if isinstance(parsed, dict):
+                    payload = parsed
+                    msg_type = parsed.get("type")
             except json.JSONDecodeError:
                 pass
+
+            # Throttle PostgreSQL last_seen writes to at most once per DB_LAST_SEEN_SYNC_INTERVAL_SEC
+            now_mono = time.monotonic()
+            if (now_mono - last_db_sync) >= DB_LAST_SEEN_SYNC_INTERVAL_SEC:
+                await _update_agent_last_seen(agent_id)
+                last_db_sync = now_mono
+
+            if not payload or not msg_type:
+                continue
+
+            if msg_type == "term_out":
+                term_data = payload.get("payload", "")
+                if isinstance(term_data, str):
+                    await ws_manager.route_to_operator(agent_id, term_data)
+
+            elif msg_type == "task_stream":
+                try:
+                    stream_frame = TaskStreamFrame.model_validate(payload)
+                    await ws_manager.route_to_operator(agent_id, stream_frame.chunk)
+                except ValidationError as exc:
+                    logger.warning("Invalid task_stream frame from Agent [%s]: %s", agent_id, exc)
+
+            elif msg_type == "task_exit":
+                try:
+                    exit_frame = TaskExitFrame.model_validate(payload)
+                    summary = (
+                        f"\r\n[Task {exit_frame.task_id}] Exited with code {exit_frame.exit_code} "
+                        f"({exit_frame.elapsed_ms}ms)\r\n"
+                    )
+                    await ws_manager.route_to_operator(agent_id, summary)
+                except ValidationError as exc:
+                    logger.warning("Invalid task_exit frame from Agent [%s]: %s", agent_id, exc)
+
+            elif msg_type == "software_inventory":
+                await handle_software_inventory(agent_id, payload)
+                await ws_manager.cache_telemetry(agent_id, msg_type, payload)
+
+            else:
+                if msg_type in ("heartbeat", "hardware_telemetry", "network_telemetry"):
+                    await ws_manager.cache_telemetry(agent_id, msg_type, payload)
+                await process_telemetry_frame(agent_id, payload)
 
     except WebSocketDisconnect:
         logger.info("Agent [%s] disconnected.", agent_id)
     finally:
-        await ws_manager.disconnect(agent_id)
+        await ws_manager.disconnect(agent_id, websocket=websocket)
 
 
 @router.websocket("/operator/{agent_id}")
 async def operator_websocket_endpoint(
     websocket: WebSocket,
     agent_id: UUID,
+    token: Optional[str] = Query(default=None),
 ):
+    if not verify_operator_ws_credentials(websocket, query_token=token):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     if not await ws_manager.connect_operator(agent_id, websocket):
         await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
         return
@@ -216,4 +282,4 @@ async def operator_websocket_endpoint(
     except WebSocketDisconnect:
         pass
     finally:
-        ws_manager.disconnect_operator(agent_id)
+        ws_manager.disconnect_operator(agent_id, websocket=websocket)

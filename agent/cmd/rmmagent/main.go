@@ -6,6 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"strings"
 	"time"
 
 	"tactical-rmm/agent/internal/authmon"
@@ -53,8 +55,15 @@ func main() {
 	flag.BoolVar(&enrollOnly, "enroll-only", false, "Perform identity bootstrap enrollment and exit immediately")
 	flag.Parse()
 
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("RMM_ENROLL_TOKEN"))
+	}
+
 	// 1. Independent bootstrap enrollment mode
 	if enrollOnly || (serverURL != "" && token != "" && serviceAction == "") {
+		if serverURL == "" || token == "" {
+			log.Fatalf("[-] Enrollment requires both -server and -token (or RMM_ENROLL_TOKEN)")
+		}
 		if err := bootstrapEnrollment(serverURL, token, caCertPath, configPath); err != nil {
 			log.Fatalf("[-] Enrollment failure: %v", err)
 		}
@@ -154,11 +163,16 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 
 	log.Printf("[*] Starting Tactical RMM Agent for Agent ID [%s]...", agentCfg.AgentID)
 
+	effectiveCACert := agentCfg.CACertPath
+	if caCertPath != "" {
+		effectiveCACert = caCertPath
+	}
+
 	wsConfig := ws.Config{
 		ServerURL:  agentCfg.ServerURL,
 		AgentID:    agentCfg.AgentID,
 		APIKey:     agentCfg.APIKey,
-		CACertPath: caCertPath,
+		CACertPath: effectiveCACert,
 	}
 
 	wsClient, err := ws.NewClient(wsConfig)

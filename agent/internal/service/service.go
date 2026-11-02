@@ -9,7 +9,7 @@ import (
 var (
 	ErrServiceAlreadyInstalled = errors.New("service is already registered in the system")
 	ErrServiceNotInstalled     = errors.New("service is not registered in the system")
-	EttUnsupporedPlatform      = errors.New("platform service manager is not supoorted")
+	ErrUnsupportedPlatform     = errors.New("platform service manager is not supported")
 )
 
 // Manager defines the unified contract for OS background service orchestration.

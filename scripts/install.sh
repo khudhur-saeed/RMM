@@ -12,6 +12,7 @@ TARGET_PATH="${INSTALL_DIR}/${BINARY_NAME}"
 SERVER_URL=""
 ENROLL_TOKEN=""
 CA_CERT_PATH=""
+LOCAL_BINARY_PATH=""
 
 log_info() {
     printf "[*] %s\n" "$1"
@@ -40,13 +41,17 @@ parse_arguments() {
                 CA_CERT_PATH="${2:-}"
                 shift 2
                 ;;
+            --local-binary)
+                LOCAL_BINARY_PATH="${2:-}"
+                shift 2
+                ;;
             -h|--help)
-                echo "Usage: install.sh --server <URL> --token <TOKEN> [--ca-cert <PATH>]"
+                echo "Usage: install.sh --server <URL> --token <TOKEN> [--ca-cert <PATH>] [--local-binary <PATH>]"
                 exit 0
                 ;;
             *)
                 log_error "Unknown parameter: $1"
-                echo "Usage: install.sh --server <URL> --token <TOKEN> [--ca-cert <PATH>]"
+                echo "Usage: install.sh --server <URL> --token <TOKEN> [--ca-cert <PATH>] [--local-binary <PATH>]"
                 exit 1
                 ;;
         esac
@@ -96,17 +101,19 @@ install_agent_binary() {
     local detected_arch="$1"
     mkdir -p "${INSTALL_DIR}"
 
-    # 1. البحث عن الثنائي المبني محلياً في مجلد المشروع لتسهيل بيئة التطوير
-    if [[ -f "agent/${BINARY_NAME}" ]]; then
-        log_info "Discovered local pre-compiled artifact at agent/${BINARY_NAME}. Installing directly..."
-        cp "agent/${BINARY_NAME}" "${TARGET_PATH}"
-    elif [[ -f "${BINARY_NAME}" ]]; then
-        log_info "Discovered local pre-compiled artifact at ./${BINARY_NAME}. Installing directly..."
-        cp "${BINARY_NAME}" "${TARGET_PATH}"
+    # 1. تثبيت ثنائي محلي فقط عند تحديده صراحةً لمنع اختطاف المسار الحالي (CWD Hijacking)
+    if [[ -n "${LOCAL_BINARY_PATH}" ]]; then
+        if [[ ! -f "${LOCAL_BINARY_PATH}" ]]; then
+            log_error "Specified local binary does not exist: ${LOCAL_BINARY_PATH}"
+            exit 1
+        fi
+        log_info "Installing explicitly specified local binary from ${LOCAL_BINARY_PATH}..."
+        cp "${LOCAL_BINARY_PATH}" "${TARGET_PATH}"
     else
-        # 2. في حال عدم وجود الثنائي محلياً، جلبه عبر الشبكة
+        # 2. جلب الثنائي عبر الشبكة باستخدام ملف مؤقت آمن (mktemp)
         local download_url="${SERVER_URL}/api/v1/download/linux/${detected_arch}"
-        local tmp_binary="/tmp/${BINARY_NAME}_bootstrap.$$"
+        local tmp_binary
+        tmp_binary="$(mktemp "/tmp/${BINARY_NAME}_bootstrap.XXXXXXXXXX")"
         log_info "Fetching ${detected_arch} agent binary from: ${download_url}"
 
         local curl_cmd=(curl -sSL --fail --connect-timeout 10 --max-time 120)
@@ -142,12 +149,12 @@ stop_existing_service() {
 enroll_agent() {
     log_info "Initiating cryptographic hardware enrollment against control plane..."
 
-    local enroll_cmd=("${TARGET_PATH}" -server "${SERVER_URL}" -token "${ENROLL_TOKEN}")
+    local enroll_cmd=("${TARGET_PATH}" -enroll-only -server "${SERVER_URL}")
     if [[ -n "${CA_CERT_PATH}" ]]; then
         enroll_cmd+=(-ca-cert "${CA_CERT_PATH}")
     fi
 
-    if ! "${enroll_cmd[@]}"; then
+    if ! RMM_ENROLL_TOKEN="${ENROLL_TOKEN}" "${enroll_cmd[@]}"; then
         log_error "Endpoint enrollment failed. Verify token validity and network routes."
         exit 1
     fi

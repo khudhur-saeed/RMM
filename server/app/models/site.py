@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import List, TYPE_CHECKING
 
-from sqlalchemy import String, ForeignKey, DateTime, func
+from sqlalchemy import String, ForeignKey, DateTime, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -20,6 +20,9 @@ class Site(Base):
     belonging to an Organization.
     """
     __tablename__ = "sites"
+    __table_args__ = (
+        UniqueConstraint("org_id", "name", name="uq_sites_org_id_name"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

@@ -7,12 +7,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import verify_operator_token
 from app.db.session import get_db
 from app.models.site import Site
 from app.models.token import EnrollmentToken
-from app.schemas.token import EnrollmentTokenCreate, EnrollmentTokenRead
+from app.schemas.token import EnrollmentTokenCreate, EnrollmentTokenPublic, EnrollmentTokenRead
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(verify_operator_token)])
 
 
 @router.post(
@@ -59,7 +60,7 @@ async def create_enrollment_token(
 
 @router.get(
     "",
-    response_model=List[EnrollmentTokenRead],
+    response_model=List[EnrollmentTokenPublic],
     status_code=status.HTTP_200_OK,
     summary="List enrollment tokens with optional site filtering",
 )

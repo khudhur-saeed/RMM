@@ -3,6 +3,7 @@ import hashlib
 import uuid
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.db.session import async_session_factory, engine
 from app.main import app
 from app.models.agent import Agent
@@ -65,35 +66,63 @@ def test_c2_streaming_protocol_ingestion():
         # Phase 2: Execute live socket interaction using TestClient
         with TestClient(app) as client:
             ws_url = f"/api/v1/ws/agent/{agent_id}?token={raw_api_key}"
+            op_url = f"/api/v1/ws/operator/{agent_id}?token={settings.ADMIN_API_TOKEN}"
             with client.websocket_connect(ws_url) as websocket:
-                # 1. Dispatch simulated live stdout chunk
-                websocket.send_json({
-                    "type": "task_stream",
-                    "task_id": str(task_id),
-                    "stream": "stdout",
-                    "chunk": "Live stdout chunk: Ping reply received\n",
-                })
+                with client.websocket_connect(op_url) as op_ws:
+                    # 1. Dispatch simulated live stdout chunk
+                    websocket.send_json({
+                        "type": "task_stream",
+                        "task_id": str(task_id),
+                        "stream": "stdout",
+                        "chunk": "Live stdout chunk: Ping reply received\n",
+                    })
+                    assert op_ws.receive_text() == "Live stdout chunk: Ping reply received\n"
 
-                # 2. Dispatch simulated live stderr chunk
-                websocket.send_json({
-                    "type": "task_stream",
-                    "task_id": str(task_id),
-                    "stream": "stderr",
-                    "chunk": "Live stderr chunk: Process warning logged\n",
-                })
+                    # 2. Dispatch simulated live stderr chunk
+                    websocket.send_json({
+                        "type": "task_stream",
+                        "task_id": str(task_id),
+                        "stream": "stderr",
+                        "chunk": "Live stderr chunk: Process warning logged\n",
+                    })
+                    assert op_ws.receive_text() == "Live stderr chunk: Process warning logged\n"
 
-                # 3. Dispatch simulated exit frame
-                websocket.send_json({
-                    "type": "task_exit",
-                    "task_id": str(task_id),
-                    "exit_code": 0,
-                    "elapsed_ms": 1250,
-                    "error": None,
-                })
+                    # 3. Dispatch simulated exit frame
+                    websocket.send_json({
+                        "type": "task_exit",
+                        "task_id": str(task_id),
+                        "exit_code": 0,
+                        "elapsed_ms": 1250,
+                        "error": None,
+                    })
+                    assert f"[Task {task_id}] Exited with code 0 (1250ms)" in op_ws.receive_text()
 
-                # If frames caused validation errors or disconnections, socket closes abnormally
-                # Sending a lightweight ping confirms socket connection remains healthy and open
-                websocket.send_json({"type": "heartbeat"})
+                    # 4. Dispatch hardware telemetry and synchronize with operator tunnel
+                    websocket.send_json({
+                        "type": "hardware_telemetry",
+                        "agent_id": str(agent_id),
+                        "timestamp": 1700000001,
+                        "cpu": {"usage_percent": 14.5, "logical_cores": 8},
+                        "memory": {"total_bytes": 16000000000, "available_bytes": 8000000000, "used_bytes": 8000000000, "used_percent": 50.0},
+                        "disks": [],
+                    })
+
+                    # Sending a lightweight ping confirms socket connection remains healthy and open
+                    websocket.send_json({"type": "heartbeat", "agent_id": str(agent_id), "timestamp": 1700000000})
+
+                    websocket.send_json({"type": "term_out", "payload": "SYN_ACK_READY"})
+                    assert op_ws.receive_text() == "SYN_ACK_READY"
+
+            # Verify unauthenticated operator requests are rejected with 401
+            unauth_resp = client.get(f"/api/v1/agents/{agent_id}")
+            assert unauth_resp.status_code == 401
+
+            # Verify authenticated operator requests succeed and return cached telemetry
+            auth_headers = {"Authorization": f"Bearer {settings.ADMIN_API_TOKEN}"}
+            telem_resp = client.get(f"/api/v1/agents/{agent_id}/telemetry", headers=auth_headers)
+            assert telem_resp.status_code == 200
+            telem_data = telem_resp.json()
+            assert telem_data["hardware_telemetry"]["cpu"]["logical_cores"] == 8
     finally:
         # TestClient ran on its own event loop; drop its pools before cleaning up
         reset_shared_async_resources()

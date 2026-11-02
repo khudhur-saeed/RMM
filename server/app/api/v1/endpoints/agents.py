@@ -1,14 +1,17 @@
 from datetime import datetime, timezone
-from typing import List
-from uuid import UUID
+from typing import Any, Dict, List
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import verify_agent_api_key, verify_operator_token
+from app.core.ws_manager import ws_manager
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.schemas.agent import AgentHeartbeat, AgentRead
+from app.schemas.task import TaskDispatchFrame
 
 router = APIRouter()
 
@@ -17,6 +20,7 @@ router = APIRouter()
     "",
     response_model=List[AgentRead],
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(verify_operator_token)],
     summary="List all registered agents across sites",
 )
 async def list_agents(
@@ -32,6 +36,7 @@ async def list_agents(
     "/{agent_id}",
     response_model=AgentRead,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(verify_operator_token)],
     summary="Get single agent metadata by UUID",
 )
 async def get_agent(
@@ -51,22 +56,18 @@ async def get_agent(
     return agent
 
 
-@router.post(
-    "/{agent_id}/heartbeat",
-    response_model=AgentRead,
+@router.get(
+    "/{agent_id}/telemetry",
+    response_model=Dict[str, Any],
     status_code=status.HTTP_200_OK,
-    summary="Process agent heartbeat and update telemetry",
+    dependencies=[Depends(verify_operator_token)],
+    summary="Get latest cached hardware, network, and heartbeat telemetry for an agent",
 )
-async def process_heartbeat(
+async def get_agent_telemetry(
     agent_id: UUID,
-    payload: AgentHeartbeat,
-    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Updates the agent's last_seen timestamp, public IP,
-    and private IP upon receiving keep-alive telemetry.
-    """
+    """Retrieves the latest telemetry snapshots cached in Redis for a monitored endpoint."""
     stmt = select(Agent).where(Agent.id == agent_id)
     result = await db.execute(stmt)
     agent = result.scalar_one_or_none()
@@ -77,6 +78,51 @@ async def process_heartbeat(
             detail="Agent not found.",
         )
 
+    return await ws_manager.get_telemetry(agent_id)
+
+
+@router.post(
+    "/{agent_id}/tasks",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(verify_operator_token)],
+    summary="Dispatch an asynchronous shell command task to a connected agent",
+)
+async def dispatch_agent_task(
+    agent_id: UUID,
+    command: str,
+    timeout_sec: int = 30,
+):
+    """Routes a TaskDispatchFrame over the active agent WebSocket tunnel."""
+    task_frame = TaskDispatchFrame(
+        task_id=uuid4(),
+        command=command,
+        timeout_sec=timeout_sec,
+    )
+    routed = await ws_manager.route_to_agent(agent_id, task_frame.model_dump_json())
+    if not routed:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Target agent is not currently connected to the C2 tunnel.",
+        )
+    return {"task_id": task_frame.task_id, "status": "dispatched"}
+
+
+@router.post(
+    "/{agent_id}/heartbeat",
+    response_model=AgentRead,
+    status_code=status.HTTP_200_OK,
+    summary="Process authenticated agent heartbeat and update telemetry",
+)
+async def process_heartbeat(
+    payload: AgentHeartbeat,
+    request: Request,
+    agent: Agent = Depends(verify_agent_api_key),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Updates the agent's last_seen timestamp, public IP,
+    and private IP upon receiving authenticated keep-alive telemetry.
+    """
     agent.last_seen = datetime.now(timezone.utc)
     if request.client:
         agent.public_ip = request.client.host

@@ -1,9 +1,12 @@
+import json
 import logging
-from typing import Dict, Union
+from typing import Any, Dict, Optional, Union
 from uuid import UUID
 
 from fastapi import WebSocket
 import redis.asyncio as redis
+
+from app.core.config import settings
 
 logger = logging.getLogger("rmm.websocket")
 
@@ -23,8 +26,9 @@ class ConnectionManager:
 
         # Async Redis client for state synchronization
         self.redis_client = redis.Redis(
-            host="127.0.0.1",
-            port=6379,
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            password=settings.REDIS_PASSWORD,
             decode_responses=True,
         )
 
@@ -43,11 +47,29 @@ class ConnectionManager:
 
         logger.info("Agent [%s] WebSocket established. Active agents: %d", key, len(self.active_connections))
 
-    async def disconnect(self, agent_id: Union[UUID, str]) -> None:
-        """Purges agent socket from memory and marks offline in Redis."""
+    async def disconnect(
+        self,
+        agent_id: Union[UUID, str],
+        websocket: Optional[WebSocket] = None,
+    ) -> None:
+        """
+        Purges agent socket from memory and marks offline in Redis.
+        When `websocket` is supplied, guards against evicting a newer reconnected socket.
+        When `websocket` is None (e.g. Watchdog eviction), closes the stale socket handle.
+        """
         key = self._canonical_id(agent_id)
-        if key in self.active_connections:
-            del self.active_connections[key]
+        current_ws = self.active_connections.get(key)
+
+        if websocket is not None and current_ws is not None and current_ws is not websocket:
+            logger.debug("Skipping stale disconnect cleanup for superseded Agent [%s] socket.", key)
+            return
+
+        removed_ws = self.active_connections.pop(key, None)
+        if websocket is None and removed_ws is not None:
+            try:
+                await removed_ws.close()
+            except Exception:
+                pass
 
         redis_key = f"agent:{key}:status"
         await self.redis_client.delete(redis_key)
@@ -66,12 +88,49 @@ class ConnectionManager:
         logger.info("Operator tunnel established for Agent [%s]. Active operators: %d", key, len(self.operator_connections))
         return True
 
-    def disconnect_operator(self, agent_id: Union[UUID, str]) -> None:
-        """Removes operator socket from memory."""
+    def disconnect_operator(
+        self,
+        agent_id: Union[UUID, str],
+        websocket: Optional[WebSocket] = None,
+    ) -> None:
+        """Removes operator socket from memory if it matches the active instance."""
         key = self._canonical_id(agent_id)
+        current_ws = self.operator_connections.get(key)
+        if websocket is not None and current_ws is not None and current_ws is not websocket:
+            return
+
         if key in self.operator_connections:
             del self.operator_connections[key]
             logger.info("Operator tunnel disconnected for Agent [%s].", key)
+
+    async def cache_telemetry(
+        self,
+        agent_id: Union[UUID, str],
+        category: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """Caches the latest agent telemetry frame in Redis with a 5-minute TTL."""
+        key = self._canonical_id(agent_id)
+        redis_key = f"agent:{key}:telemetry:{category}"
+        await self.redis_client.set(name=redis_key, value=json.dumps(payload), ex=300)
+
+    async def get_telemetry(self, agent_id: Union[UUID, str]) -> Dict[str, Any]:
+        """Retrieves cached heartbeat, hardware, and network telemetry snapshots from Redis."""
+        key = self._canonical_id(agent_id)
+        categories = ("heartbeat", "hardware_telemetry", "network_telemetry")
+        keys = [f"agent:{key}:telemetry:{cat}" for cat in categories]
+        raw_values = await self.redis_client.mget(keys)
+
+        result: Dict[str, Any] = {}
+        for cat, raw in zip(categories, raw_values):
+            if raw:
+                try:
+                    result[cat] = json.loads(raw)
+                except json.JSONDecodeError:
+                    result[cat] = None
+            else:
+                result[cat] = None
+        return result
 
     async def route_to_operator(self, agent_id: Union[UUID, str], data: str) -> bool:
         """Routes raw stdout/echo from Agent PTY to Operator's xterm.js."""

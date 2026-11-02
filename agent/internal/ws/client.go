@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -56,7 +58,21 @@ type Client struct {
 
 	isClosed  bool
 	closeOnce sync.Once
-	executor  agentExec.CommandExecutor
+}
+
+func isLoopbackHost(host string) bool {
+	hostname := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		hostname = h
+	}
+	hostname = strings.Trim(hostname, "[]")
+	if strings.EqualFold(hostname, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(hostname); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // NewClient initializes the WebSocket client enforcing TLS 1.3 and Root CA verification.
@@ -85,26 +101,32 @@ func NewClient(cfg Config) (*Client, error) {
 			HandshakeTimeout: 15 * time.Second,
 		},
 		outboundChan: make(chan []byte, 128),
-		executor:     agentExec.NewExecutor(),
 	}, nil
 }
 
 func (c *Client) buildWebSocketURL() (string, error) {
 	parsed, err := url.Parse(c.config.ServerURL)
-	if err != nil {
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return "", fmt.Errorf("invalid server URL: %w", err)
 	}
 
-	scheme := "ws"
-	if parsed.Scheme == "https" || parsed.Scheme == "wss" {
+	var scheme string
+	switch parsed.Scheme {
+	case "https", "wss":
 		scheme = "wss"
+	case "http", "ws":
+		if !isLoopbackHost(parsed.Host) {
+			return "", fmt.Errorf("insecure transport rejected: non-loopback C2 host %q requires wss/https", parsed.Host)
+		}
+		scheme = "ws"
+	default:
+		return "", fmt.Errorf("unsupported URL scheme %q", parsed.Scheme)
 	}
 
-	wsURL := fmt.Sprintf("%s://%s/api/v1/ws/agent/%s?token=%s",
+	wsURL := fmt.Sprintf("%s://%s/api/v1/ws/agent/%s",
 		scheme,
 		parsed.Host,
-		c.config.AgentID,
-		url.QueryEscape(c.config.APIKey),
+		url.PathEscape(c.config.AgentID),
 	)
 
 	return wsURL, nil
@@ -150,8 +172,12 @@ func (c *Client) Run(ctx context.Context) {
 			return
 		}
 
+		headers := http.Header{
+			"Authorization": []string{"Bearer " + c.config.APIKey},
+		}
+
 		log.Printf("[*] [WS] Attempting secure C2 handshake: %s", sanitizeLogURL(wsURL))
-		conn, resp, err := c.dialer.DialContext(ctx, wsURL, nil)
+		conn, resp, err := c.dialer.DialContext(ctx, wsURL, headers)
 		if err != nil {
 			statusCode := 0
 			if resp != nil {
@@ -244,6 +270,7 @@ func (c *Client) readPump(ctx context.Context, conn *websocket.Conn) {
 		c.connMutex.Lock()
 		if c.conn != nil {
 			_ = c.conn.Close()
+			c.conn = nil
 		}
 		c.connMutex.Unlock()
 	}()

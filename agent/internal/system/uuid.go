@@ -4,14 +4,17 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
+
+	"tactical-rmm/agent/internal/config"
 )
 
-const (
-	stateDir  = "/var/lib/rmmagent"
-	stateFile = "/var/lib/rmmagent/agent_uuid"
-)
+func resolveUUIDStatePath() (string, string) {
+	dir := config.DefaultConfigDir()
+	return dir, filepath.Join(dir, "agent_uuid")
+}
 
 // GetOrCreateHardwareUUID resolves the persistent hardware UUID or generates a deterministic fallback.
 func GetOrCreateHardwareUUID(macs []string, hostname string) string {
@@ -39,6 +42,7 @@ func GetOrCreateHardwareUUID(macs []string, hostname string) string {
 
 // readCachedUUID reads the persistent UUID from the local state file.
 func readCachedUUID() string {
+	_, stateFile := resolveUUIDStatePath()
 	data, err := os.ReadFile(stateFile)
 	if err != nil {
 		return ""
@@ -79,6 +83,7 @@ func formatDeterministicUUID(seed string) string {
 
 // persistUUID writes the generated UUID to a root-restricted local path.
 func persistUUID(uuidVal string) {
+	stateDir, stateFile := resolveUUIDStatePath()
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return
 	}

@@ -7,8 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"tactical-rmm/agent/internal/system"
@@ -41,8 +44,32 @@ type EnrollmentClient struct {
 	HTTPClient *http.Client
 }
 
+func isLoopbackHost(host string) bool {
+	hostname := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		hostname = h
+	}
+	hostname = strings.Trim(hostname, "[]")
+	if strings.EqualFold(hostname, "localhost") {
+		return true
+	}
+	if ip := net.ParseIP(hostname); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
 // NewEnrollmentClient initializes an HTTP client pinned to an optional custom Root CA
 func NewEnrollmentClient(serverURL string, caCertPath string, timeout time.Duration) (*EnrollmentClient, error) {
+	parsedURL, err := url.Parse(strings.TrimRight(serverURL, "/"))
+	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return nil, fmt.Errorf("invalid server URL %q", serverURL)
+	}
+
+	if parsedURL.Scheme != "https" && !(parsedURL.Scheme == "http" && isLoopbackHost(parsedURL.Host)) {
+		return nil, fmt.Errorf("insecure transport rejected: server URL %q must use HTTPS for non-loopback targets", serverURL)
+	}
+
 	tlsConfig := &tls.Config{
 		MinVersion: tls.VersionTLS13,
 	}

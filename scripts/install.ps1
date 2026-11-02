@@ -14,6 +14,9 @@ param (
     [Parameter(Mandatory = $false, HelpMessage = "Optional local path to Root CA certificate")]
     [string]$CaCertPath = "",
 
+    [Parameter(Mandatory = $false, HelpMessage = "Optional explicit local path to pre-compiled agent binary")]
+    [string]$LocalBinaryPath = "",
+
     [Parameter(Mandatory = $false, HelpMessage = "Target destination installation path")]
     [string]$InstallDir = "C:\Program Files\rmmagent"
 )
@@ -91,21 +94,16 @@ function Install-AgentBinary {
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     }
 
-    # 1. Check for local pre-compiled artifact in working directory
-    $localArtifacts = @(
-        ".\rmmagent.exe",
-        ".\agent\rmmagent.exe",
-        ".\agent\build\rmmagent.exe"
-    )
-
+    # 1. Stage local binary only when explicitly supplied via -LocalBinaryPath
     $staged = $false
-    foreach ($artifact in $localArtifacts) {
-        if (Test-Path -Path $artifact) {
-            Write-LogInfo "Discovered local pre-compiled artifact at '$artifact'. Staging directly..."
-            Copy-Item -Path $artifact -Destination $binaryTarget -Force
-            $staged = $true
-            break
+    if ($LocalBinaryPath -ne "") {
+        if (-not (Test-Path -Path $LocalBinaryPath)) {
+            Write-LogError "Specified LocalBinaryPath does not exist: '$LocalBinaryPath'"
+            exit 1
         }
+        Write-LogInfo "Staging explicitly supplied artifact from '$LocalBinaryPath'..."
+        Copy-Item -Path $LocalBinaryPath -Destination $binaryTarget -Force
+        $staged = $true
     }
 
     # 2. Network retrieval fallback
@@ -136,12 +134,17 @@ function Register-AndStartService {
 
     # 1. Perform enrollment bootstrap
     Write-LogInfo "Initiating agent enrollment bootstrap..."
-    $enrollArgs = @("-server", $ServerUrl, "-token", $Token)
+    $enrollArgs = @("-enroll-only", "-server", $ServerUrl)
     if ($CaCertPath -ne "" -and (Test-Path -Path $CaCertPath)) {
         $enrollArgs += @("-ca-cert", $CaCertPath)
     }
 
-    $enrollProc = Start-Process -FilePath $BinaryPath -ArgumentList $enrollArgs -Wait -NoNewWindow -PassThru
+    $env:RMM_ENROLL_TOKEN = $Token
+    try {
+        $enrollProc = Start-Process -FilePath $BinaryPath -ArgumentList $enrollArgs -Wait -NoNewWindow -PassThru
+    } finally {
+        Remove-Item Env:\RMM_ENROLL_TOKEN -ErrorAction SilentlyContinue
+    }
     if ($enrollProc.ExitCode -ne 0) {
         Write-LogError "Agent enrollment failed with exit code: $($enrollProc.ExitCode)"
         exit $enrollProc.ExitCode

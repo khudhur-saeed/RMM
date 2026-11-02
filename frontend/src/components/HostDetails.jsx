@@ -7,8 +7,11 @@ import "xterm/css/xterm.css";
 import AlertCenter from "./AlertCenter";
 import TelemetryCharts from "./TelemetryCharts";
 
-export default function HostDetails() {
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export default function HostDetails({ operatorToken }) {
   const { id } = useParams();
+  const isValidUUID = Boolean(id && UUID_REGEX.test(id));
   const [agent, setAgent] = useState(null);
   const [error, setError] = useState(null);
 
@@ -24,10 +27,20 @@ export default function HostDetails() {
 
   // 1. جلب بيانات الجهاز وتحديثها دورياً مع تغذية السلسلة الزمنية
   useEffect(() => {
+    if (!isValidUUID) return;
+
     let cancelled = false;
+    const activeToken =
+      operatorToken ||
+      sessionStorage.getItem("rmm_operator_token") ||
+      "rmm_admin_dev_token_2026";
 
     const fetchAgentDetails = () =>
-      fetch(`/api/v1/agents/${id}`)
+      fetch(`/api/v1/agents/${encodeURIComponent(id)}`, {
+        headers: {
+          Authorization: `Bearer ${activeToken}`,
+        },
+      })
         .then((response) => {
           if (!response.ok)
             throw new Error(`HTTP error! status: ${response.status}`);
@@ -86,11 +99,17 @@ export default function HostDetails() {
       cancelled = true;
       clearInterval(interval);
     };
-  }, [id]);
+  }, [id, isValidUUID, operatorToken]);
 
   // 2. تهيئة xterm.js ومقبس المشغل التفاعلي عبر الرابط الديناميكي
   useEffect(() => {
-    if (!terminalRef.current) return;
+    if (!terminalRef.current || !isValidUUID) return;
+
+    let disposed = false;
+    const activeToken =
+      operatorToken ||
+      sessionStorage.getItem("rmm_operator_token") ||
+      "rmm_admin_dev_token_2026";
 
     const term = new Terminal({
       cursorBlink: true,
@@ -115,38 +134,42 @@ export default function HostDetails() {
 
     // اعتماد الرابط الديناميكي الأصلي المتوافق مع Vite Proxy والإنتاج
     const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const wsUrl = `${wsProtocol}://${window.location.host}/api/v1/ws/operator/${id}`;
+    const wsUrl = `${wsProtocol}://${window.location.host}/api/v1/ws/operator/${encodeURIComponent(id)}?token=${encodeURIComponent(activeToken)}`;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (disposed) return;
       term.writeln(
-        "\r\n[+] Operator tunnel established. Ready for interactive session.",
+        "\r\n[+] Operator tunnel established. Press Enter to initialize shell.",
       );
-      term.write("\r\n$ ");
     };
 
     ws.onmessage = (event) => {
+      if (disposed) return;
       term.write(event.data);
     };
 
     ws.onerror = () => {
+      if (disposed) return;
       term.writeln(
-        "\r\n[-] WebSocket connection failed. Verify server and agent status.",
+        "\r\n[-] WebSocket connection failed. Verify server, token, and agent status.",
       );
     };
 
     ws.onclose = () => {
+      if (disposed) return;
       term.writeln("\r\n[-] Session disconnected from control plane.");
     };
 
-    term.onData((data) => {
-      if (ws.readyState === WebSocket.OPEN) {
+    const dataDisposable = term.onData((data) => {
+      if (!disposed && ws.readyState === WebSocket.OPEN) {
         ws.send(data);
       }
     });
 
     const handleResize = () => {
+      if (disposed) return;
       try {
         fitAddon.fit();
       } catch {
@@ -156,11 +179,13 @@ export default function HostDetails() {
     window.addEventListener("resize", handleResize);
 
     return () => {
+      disposed = true;
       window.removeEventListener("resize", handleResize);
+      dataDisposable.dispose();
       ws.close();
       term.dispose();
     };
-  }, [id]);
+  }, [id, isValidUUID, operatorToken]);
 
   // دالة استبعاد التنبيهات من الواجهة
   const handleDismissAlert = (alertId) => {
@@ -216,7 +241,7 @@ export default function HostDetails() {
               color: "#111827",
             }}
           >
-            {agent ? agent.hostname : "Loading host..."}
+            {agent ? agent.hostname : (isValidUUID ? "Loading host..." : "Invalid Host UUID")}
             <span
               style={{
                 height: "14px",
@@ -237,9 +262,22 @@ export default function HostDetails() {
             fontFamily: "monospace",
           }}
         >
-          UUID: {id}
+          UUID: {isValidUUID ? id : "INVALID"}
         </div>
       </div>
+
+      {!isValidUUID && (
+        <div
+          style={{
+            color: "#dc2626",
+            backgroundColor: "#fee2e2",
+            padding: "10px 14px",
+            borderRadius: "6px",
+          }}
+        >
+          Error: Invalid Agent UUID parameter.
+        </div>
+      )}
 
       {error && (
         <div

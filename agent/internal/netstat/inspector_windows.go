@@ -84,6 +84,10 @@ func getWindowsTCPConnections() ([]SocketEntry, error) {
 		return nil, fmt.Errorf("initial TCP sizing call failed with code: %d", ret)
 	}
 
+	if size < 4 {
+		return []SocketEntry{}, nil
+	}
+
 	buf := make([]byte, size)
 	ret, _, _ = procGetExtendedTcpTable.Call(
 		uintptr(unsafe.Pointer(&buf[0])),
@@ -105,6 +109,9 @@ func getWindowsTCPConnections() ([]SocketEntry, error) {
 	var results []SocketEntry
 
 	for i := uint32(0); i < numEntries; i++ {
+		if offset+rowSize > uintptr(len(buf)) {
+			break
+		}
 		row := (*mibTcpRowOwnerPID)(unsafe.Pointer(&buf[offset]))
 		offset += rowSize
 
@@ -155,6 +162,10 @@ func getWindowsUDPListeners() ([]SocketEntry, error) {
 		return nil, fmt.Errorf("initial UDP sizing call failed with code: %d", ret)
 	}
 
+	if size < 4 {
+		return []SocketEntry{}, nil
+	}
+
 	buf := make([]byte, size)
 	ret, _, _ = procGetExtendedUdpTable.Call(
 		uintptr(unsafe.Pointer(&buf[0])),
@@ -176,6 +187,9 @@ func getWindowsUDPListeners() ([]SocketEntry, error) {
 	var results []SocketEntry
 
 	for i := uint32(0); i < numEntries; i++ {
+		if offset+rowSize > uintptr(len(buf)) {
+			break
+		}
 		row := (*mibUdpRowOwnerPID)(unsafe.Pointer(&buf[offset]))
 		offset += rowSize
 

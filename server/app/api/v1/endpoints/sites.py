@@ -3,14 +3,16 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import verify_operator_token
 from app.db.session import get_db
 from app.models.organization import Organization
 from app.models.site import Site
 from app.schemas.site import SiteCreate, SiteRead
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(verify_operator_token)])
 
 
 @router.post(
@@ -58,7 +60,14 @@ async def create_site(
         org_id=payload.org_id,
     )
     db.add(new_site)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Site with name '{payload.name}' already exists in this organization.",
+        )
     await db.refresh(new_site)
 
     return new_site

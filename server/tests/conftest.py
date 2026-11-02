@@ -5,6 +5,7 @@ import pytest
 import redis.asyncio as redis
 from sqlalchemy import delete
 
+from app.core.config import settings
 from app.core.ws_manager import ws_manager
 from app.db.session import async_session_factory, engine
 from app.models.organization import Organization
@@ -19,8 +20,9 @@ def reset_shared_async_resources() -> None:
     """
     engine.sync_engine.dispose(close=False)
     ws_manager.redis_client = redis.Redis(
-        host="127.0.0.1",
-        port=6379,
+        host=settings.REDIS_HOST,
+        port=settings.REDIS_PORT,
+        password=settings.REDIS_PASSWORD,
         decode_responses=True,
     )
 

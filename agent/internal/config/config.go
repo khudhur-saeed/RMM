@@ -23,10 +23,15 @@ func DefaultConfigDir() string {
 }
 
 // ResolveConfigPath determines the active configuration file path.
-// It checks: 1) Explicit path, 2) Executable directory config.json, 3) OS system path.
+// It checks: 1) Explicit path, 2) OS system path (/var/lib/rmmagent or ProgramData), 3) Executable directory fallback.
 func ResolveConfigPath(explicitPath string) string {
 	if explicitPath != "" {
 		return explicitPath
+	}
+
+	systemCfg := filepath.Join(DefaultConfigDir(), "config.json")
+	if _, err := os.Stat(systemCfg); err == nil {
+		return systemCfg
 	}
 
 	if exePath, err := os.Executable(); err == nil {
@@ -36,7 +41,7 @@ func ResolveConfigPath(explicitPath string) string {
 		}
 	}
 
-	return filepath.Join(DefaultConfigDir(), "config.json")
+	return systemCfg
 }
 
 // AgentConfig represents the persistent cryptographic identity and C2 parameters.
@@ -95,42 +100,20 @@ func SaveConfig(cfg *AgentConfig, targetPath string) error {
 		return fmt.Errorf("failed to write temporary config: %w", err)
 	}
 
+	if err := EnforceSecureStoragePermissions(tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to enforce secure permissions on temporary config: %w", err)
+	}
+
 	// 2. Atomically rename temporary file over target configuration file
 	if err := os.Rename(tmpPath, resolvedPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("failed to atomically commit config: %w", err)
 	}
 
+	if err := EnforceSecureStoragePermissions(resolvedPath); err != nil {
+		return fmt.Errorf("failed to enforce secure permissions on committed config: %w", err)
+	}
+
 	return nil
-}
-
-// EnsureBootstrapConfig loads existing config or generates a safe default bootstrap config
-// so the background service starts cleanly without exiting on fresh installations.
-func EnsureBootstrapConfig(path string, defaultHardwareUUID string) (*AgentConfig, string, error) {
-	resolvedPath := ResolveConfigPath(path)
-
-	cfg, err := LoadConfig(resolvedPath)
-	if err == nil {
-		return cfg, resolvedPath, nil
-	}
-
-	bootstrapCfg := &AgentConfig{
-		ServerURL:    "ws://127.0.0.1:8000",
-		AgentID:      defaultHardwareUUID,
-		APIKey:       "bootstrap_pending_enrollment",
-		HardwareUUID: defaultHardwareUUID,
-	}
-
-	if saveErr := SaveConfig(bootstrapCfg, resolvedPath); saveErr != nil {
-		// Fallback to executable directory if system directory write fails
-		if exePath, exeErr := os.Executable(); exeErr == nil {
-			fallbackPath := filepath.Join(filepath.Dir(exePath), "config.json")
-			if fallbackErr := SaveConfig(bootstrapCfg, fallbackPath); fallbackErr == nil {
-				return bootstrapCfg, fallbackPath, nil
-			}
-		}
-		return nil, resolvedPath, fmt.Errorf("failed to initialize bootstrap config: %w", saveErr)
-	}
-
-	return bootstrapCfg, resolvedPath, nil
 }
