@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.crypto import get_signing_keypair
 from app.db.session import get_db
 from app.models.agent import Agent
 from app.models.token import EnrollmentToken
@@ -86,7 +87,8 @@ async def enroll_agent(
     await db.commit()
     await db.refresh(new_agent)
 
-    # 7. Construct and Return AgentEnrollResponse with raw API key
+    # 7. Construct and Return AgentEnrollResponse with raw API key & Ed25519 verification public key
+    keypair = get_signing_keypair()
     return AgentEnrollResponse(
         id=new_agent.id,
         site_id=new_agent.site_id,
@@ -97,4 +99,6 @@ async def enroll_agent(
         last_seen=new_agent.last_seen,
         created_at=new_agent.created_at,
         api_key=raw_api_key,
+        signing_public_key=keypair.public_key_b64,
+        signing_public_key_pem=keypair.public_key_pem,
     )

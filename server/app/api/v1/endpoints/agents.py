@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.crypto import sign_task_dispatch
 from app.core.security import verify_agent_api_key, verify_operator_token
 from app.core.ws_manager import ws_manager
 from app.db.session import get_db
@@ -140,11 +141,18 @@ async def dispatch_agent_task(
     command: str,
     timeout_sec: int = 30,
 ):
-    """Routes a TaskDispatchFrame over the active agent WebSocket tunnel."""
-    task_frame = TaskDispatchFrame(
-        task_id=uuid4(),
+    """Routes a signed TaskDispatchFrame over the active agent WebSocket tunnel."""
+    task_id = uuid4()
+    signature = sign_task_dispatch(
+        task_id=task_id,
         command=command,
         timeout_sec=timeout_sec,
+    )
+    task_frame = TaskDispatchFrame(
+        task_id=task_id,
+        command=command,
+        timeout_sec=timeout_sec,
+        signature=signature,
     )
     routed = await ws_manager.route_to_agent(agent_id, task_frame.model_dump_json())
     if not routed:
@@ -152,7 +160,11 @@ async def dispatch_agent_task(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Target agent is not currently connected to the C2 tunnel.",
         )
-    return {"task_id": task_frame.task_id, "status": "dispatched"}
+    return {
+        "task_id": task_frame.task_id,
+        "signature": signature,
+        "status": "dispatched",
+    }
 
 
 @router.post(

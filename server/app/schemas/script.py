@@ -140,4 +140,8 @@ class ScriptRenderResponse(BaseModel):
     shell_type: ShellType
     rendered_command: str
     timeout_sec: int
+    signature: Optional[str] = Field(
+        default=None,
+        description="Base64-encoded Ed25519 detached signature over rendered_command (or dispatched task frame)",
+    )
     dispatched_task_id: Optional[UUID] = None

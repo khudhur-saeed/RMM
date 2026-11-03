@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     # Control Plane Operator Authentication
     ADMIN_API_TOKEN: str = "rmm_admin_dev_token_2026"
 
+    # Ed25519 Cryptographic Code-Signing Key Configuration
+    SIGNING_KEY_DIR: str = ".keys"
+    ED25519_PRIVATE_KEY: Optional[str] = None
+
     @property
     def async_database_url(self) -> str:
         """Constructs the asynchronous PostgreSQL connection URL for asyncpg."""

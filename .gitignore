@@ -4,6 +4,8 @@
 *.pem
 *.key
 *.crt
+.keys/
+server/.keys/
 
 # Go Endpoint Agent
 agent/bin/

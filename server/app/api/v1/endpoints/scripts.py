@@ -7,6 +7,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.crypto import sign_payload, sign_task_dispatch
 from app.core.security import verify_operator_token
 from app.core.ws_manager import ws_manager
 from app.db.session import get_db
@@ -332,11 +333,19 @@ async def render_script(
     )
 
     dispatched_task_id: Optional[UUID] = None
+    signature: str
     if payload.agent_id is not None:
-        task_frame = TaskDispatchFrame(
-            task_id=uuid4(),
+        task_id = uuid4()
+        signature = sign_task_dispatch(
+            task_id=task_id,
             command=rendered_command,
             timeout_sec=script.timeout_sec,
+        )
+        task_frame = TaskDispatchFrame(
+            task_id=task_id,
+            command=rendered_command,
+            timeout_sec=script.timeout_sec,
+            signature=signature,
         )
         routed = await ws_manager.route_to_agent(
             payload.agent_id,
@@ -348,6 +357,8 @@ async def render_script(
                 detail="Target agent is not currently connected to the C2 tunnel.",
             )
         dispatched_task_id = task_frame.task_id
+    else:
+        signature = sign_payload(rendered_command)
 
     return ScriptRenderResponse(
         script_id=script.id,
@@ -355,5 +366,6 @@ async def render_script(
         shell_type=script.shell_type,  # type: ignore[arg-type]
         rendered_command=rendered_command,
         timeout_sec=script.timeout_sec,
+        signature=signature,
         dispatched_task_id=dispatched_task_id,
     )

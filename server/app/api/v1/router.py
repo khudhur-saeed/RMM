@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import agents, enroll, health, organizations, scripts, sites, tokens, ws
+from app.api.v1.endpoints import agents, enroll, health, keys, organizations, scripts, sites, tokens, ws
 
 api_v1_router = APIRouter()
 
@@ -46,6 +46,13 @@ api_v1_router.include_router(
     scripts.router,
     prefix="/scripts",
     tags=["Script Keystore"],
+)
+
+# Ed25519 Code-Signing & Agent Public Key Verification
+api_v1_router.include_router(
+    keys.router,
+    prefix="/keys",
+    tags=["Cryptographic Keys"],
 )
 
 # Real-Time Full-Duplex Command & Telemetry Tunnels

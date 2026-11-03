@@ -58,9 +58,18 @@ class AgentRead(AgentBase):
 class AgentEnrollResponse(AgentRead):
     """
     Outbound schema returned strictly once upon successful enrollment.
-    Delivers the plaintext agent API key to the endpoint daemon.
+    Delivers the plaintext agent API key and server Ed25519 verification public key
+    to the endpoint daemon.
     """
     api_key: str = Field(
         ...,
         description="Cryptographically generated raw API key. Only returned once during enrollment.",
+    )
+    signing_public_key: Optional[str] = Field(
+        default=None,
+        description="Base64-encoded 32-byte Ed25519 public key for verifying signed server commands/scripts.",
+    )
+    signing_public_key_pem: Optional[str] = Field(
+        default=None,
+        description="SubjectPublicKeyInfo PEM-encoded Ed25519 public key for signature verification.",
     )
