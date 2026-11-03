@@ -28,14 +28,24 @@ type EnrollmentPayload struct {
 
 // EnrollmentResponse matches the FastAPI AgentEnrollResponse schema
 type EnrollmentResponse struct {
-	ID        string    `json:"id"`
-	SiteID    string    `json:"site_id"`
-	Hostname  string    `json:"hostname"`
-	OS        string    `json:"os"`
-	PrivateIP string    `json:"private_ip"`
-	PublicIP  string    `json:"public_ip"`
-	APIKey    string    `json:"api_key"`
-	CreatedAt time.Time `json:"created_at"`
+	ID                  string    `json:"id"`
+	SiteID              string    `json:"site_id"`
+	Hostname            string    `json:"hostname"`
+	OS                  string    `json:"os"`
+	PrivateIP           string    `json:"private_ip"`
+	PublicIP            string    `json:"public_ip"`
+	APIKey              string    `json:"api_key"`
+	SigningPublicKey    string    `json:"signing_public_key,omitempty"`
+	SigningPublicKeyPEM string    `json:"signing_public_key_pem,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+}
+
+// PublicKeyResponse matches the FastAPI PublicKeyRead schema (/api/v1/keys/public)
+type PublicKeyResponse struct {
+	Algorithm         string `json:"algorithm"`
+	PublicKeyB64      string `json:"public_key_b64"`
+	PublicKeyPEM      string `json:"public_key_pem"`
+	FingerprintSHA256 string `json:"fingerprint_sha256"`
 }
 
 // EnrollmentClient orchestrates identity dispatch and secure TLS server validation
@@ -145,4 +155,35 @@ func (c *EnrollmentClient) EnrollEndpoint(token string, host *system.HostInfo) (
 	}
 
 	return &enrollResp, nil
+}
+
+// FetchServerPublicKey retrieves the server's active Ed25519 verification public key.
+func (c *EnrollmentClient) FetchServerPublicKey() (*PublicKeyResponse, error) {
+	endpointURL := fmt.Sprintf("%s/api/v1/keys/public", strings.TrimRight(c.ServerURL, "/"))
+	req, err := http.NewRequest(http.MethodGet, endpointURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build public key request: %w", err)
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch server public key: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read public key response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("public key request rejected (status %d): %s", resp.StatusCode, string(respBytes))
+	}
+
+	var pubResp PublicKeyResponse
+	if err := json.Unmarshal(respBytes, &pubResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal public key response: %w", err)
+	}
+
+	return &pubResp, nil
 }

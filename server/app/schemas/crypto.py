@@ -32,8 +32,12 @@ class SignPayloadRequest(BaseModel):
 
 
 class SignPayloadResponse(BaseModel):
-    """Outbound response containing the Ed25519 detached signature and verification public key metadata."""
+    """Outbound response containing the SHA-256 payload digest, Ed25519 detached signature, and public key metadata."""
     algorithm: Literal["Ed25519"] = "Ed25519"
+    payload_sha256: str = Field(
+        ...,
+        description="Lowercase hex-encoded SHA-256 digest of the signed payload",
+    )
     signature_b64: str = Field(
         ...,
         description="Base64-encoded 64-byte Ed25519 signature",

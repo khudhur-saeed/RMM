@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
+import secrets
 from typing import Optional, Union
 from uuid import UUID
 
@@ -239,6 +240,22 @@ def build_canonical_task_payload(
     return f"{task_id}:{timeout_sec}:{command}".encode("utf-8")
 
 
+def compute_payload_digest(data: Union[bytes, str]) -> str:
+    """Computes the lowercase hex-encoded SHA-256 digest of a raw byte or UTF-8 string payload."""
+    payload_bytes = data.encode("utf-8") if isinstance(data, str) else data
+    return hashlib.sha256(payload_bytes).hexdigest()
+
+
+def compute_task_digest(
+    task_id: Union[UUID, str],
+    command: str,
+    timeout_sec: int,
+) -> str:
+    """Computes the lowercase hex-encoded SHA-256 digest of the canonical C2 task payload."""
+    canonical = build_canonical_task_payload(task_id=task_id, command=command, timeout_sec=timeout_sec)
+    return compute_payload_digest(canonical)
+
+
 def sign_payload(
     data: Union[bytes, str],
     private_key: Optional[Union[Ed25519PrivateKey, str]] = None,
@@ -307,7 +324,15 @@ def verify_task_dispatch(
     timeout_sec: int,
     signature_b64: str,
     public_key: Optional[Union[Ed25519PublicKey, str]] = None,
+    payload_sha256: Optional[str] = None,
 ) -> bool:
-    """Verifies an Ed25519 signature on a C2 task/script dispatch frame."""
+    """
+    Verifies an Ed25519 signature (and optional SHA-256 payload digest)
+    on a C2 task/script dispatch frame.
+    """
     canonical = build_canonical_task_payload(task_id=task_id, command=command, timeout_sec=timeout_sec)
+    if payload_sha256 is not None:
+        expected_digest = compute_payload_digest(canonical)
+        if not secrets.compare_digest(payload_sha256.strip().lower(), expected_digest):
+            return False
     return verify_signature(canonical, signature_b64=signature_b64, public_key=public_key)

@@ -232,6 +232,8 @@ def test_scripts_keystore_crud_tagging_and_parameterization():
                 assert c2_frame["task_id"] == dispatch_data["dispatched_task_id"]
                 assert c2_frame["command"] == "nc -zv 10.0.0.1 8443"
                 assert c2_frame["timeout_sec"] == 120
+                assert c2_frame["payload_sha256"] == dispatch_data["payload_sha256"]
+                assert c2_frame["signature"] == dispatch_data["signature"]
 
             # 7. Delete scripts and verify 404
             del_resp = client.delete(

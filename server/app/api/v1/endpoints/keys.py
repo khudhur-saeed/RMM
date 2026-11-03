@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.core.crypto import (
     Ed25519KeyPair,
+    compute_payload_digest,
     get_signing_keypair,
     load_public_key,
     sign_payload,
@@ -70,11 +71,13 @@ async def rotate_signing_key():
 async def sign_script_payload(
     request: SignPayloadRequest,
 ):
-    """Signs the provided UTF-8 payload string with the server's active Ed25519 private key."""
+    """Computes the SHA-256 digest and signs the provided UTF-8 payload string with the server's active Ed25519 private key."""
     keypair = get_signing_keypair()
+    digest = compute_payload_digest(request.payload)
     sig_b64 = sign_payload(request.payload, private_key=keypair.private_key)
     return SignPayloadResponse(
         algorithm="Ed25519",
+        payload_sha256=digest,
         signature_b64=sig_b64,
         public_key_b64=keypair.public_key_b64,
         fingerprint_sha256=keypair.fingerprint_sha256,

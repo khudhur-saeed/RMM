@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.crypto import sign_task_dispatch
+from app.core.crypto import compute_task_digest, sign_task_dispatch
 from app.core.security import verify_agent_api_key, verify_operator_token
 from app.core.ws_manager import ws_manager
 from app.db.session import get_db
@@ -143,6 +143,11 @@ async def dispatch_agent_task(
 ):
     """Routes a signed TaskDispatchFrame over the active agent WebSocket tunnel."""
     task_id = uuid4()
+    payload_sha256 = compute_task_digest(
+        task_id=task_id,
+        command=command,
+        timeout_sec=timeout_sec,
+    )
     signature = sign_task_dispatch(
         task_id=task_id,
         command=command,
@@ -152,6 +157,7 @@ async def dispatch_agent_task(
         task_id=task_id,
         command=command,
         timeout_sec=timeout_sec,
+        payload_sha256=payload_sha256,
         signature=signature,
     )
     routed = await ws_manager.route_to_agent(agent_id, task_frame.model_dump_json())
@@ -162,6 +168,7 @@ async def dispatch_agent_task(
         )
     return {
         "task_id": task_frame.task_id,
+        "payload_sha256": payload_sha256,
         "signature": signature,
         "status": "dispatched",
     }

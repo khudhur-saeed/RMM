@@ -140,6 +140,10 @@ class ScriptRenderResponse(BaseModel):
     shell_type: ShellType
     rendered_command: str
     timeout_sec: int
+    payload_sha256: Optional[str] = Field(
+        default=None,
+        description="Hex-encoded SHA-256 digest of the signed script or canonical task payload",
+    )
     signature: Optional[str] = Field(
         default=None,
         description="Base64-encoded Ed25519 detached signature over rendered_command (or dispatched task frame)",

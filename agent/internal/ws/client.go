@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	agentCrypto "tactical-rmm/agent/internal/crypto"
 	agentExec "tactical-rmm/agent/internal/exec"
 	"tactical-rmm/agent/internal/terminal"
 )
@@ -32,10 +34,11 @@ const (
 
 // Config defines connection parameters for the WebSocket client.
 type Config struct {
-	ServerURL  string
-	AgentID    string
-	APIKey     string
-	CACertPath string
+	ServerURL        string
+	AgentID          string
+	APIKey           string
+	CACertPath       string
+	SigningPublicKey string
 }
 
 // InboundEnvelope defines the generic discriminator for demultiplexing incoming frames.
@@ -46,11 +49,12 @@ type InboundEnvelope struct {
 
 // Client encapsulates the full-duplex WebSocket connection lifecycle and interactive sessions.
 type Client struct {
-	config       Config
-	dialer       websocket.Dialer
-	conn         *websocket.Conn
-	connMutex    sync.Mutex
-	outboundChan chan []byte
+	config        Config
+	signingPubKey ed25519.PublicKey
+	dialer        websocket.Dialer
+	conn          *websocket.Conn
+	connMutex     sync.Mutex
+	outboundChan  chan []byte
 
 	// PTY Interactive Session Management
 	termSession *terminal.Session
@@ -94,8 +98,18 @@ func NewClient(cfg Config) (*Client, error) {
 		tlsConfig.RootCAs = caCertPool
 	}
 
+	var parsedPubKey ed25519.PublicKey
+	if strings.TrimSpace(cfg.SigningPublicKey) != "" {
+		pub, err := agentCrypto.ParseEd25519PublicKey(cfg.SigningPublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse Ed25519 signing public key: %w", err)
+		}
+		parsedPubKey = pub
+	}
+
 	return &Client{
-		config: cfg,
+		config:        cfg,
+		signingPubKey: parsedPubKey,
 		dialer: websocket.Dialer{
 			TLSClientConfig:  tlsConfig,
 			HandshakeTimeout: 15 * time.Second,
@@ -330,13 +344,31 @@ func (c *Client) handleTerminalInput(payload string) {
 	}
 }
 
-// handleTaskDispatch streams execution output live and captures the process exit code.
+// VerifyTaskDispatch validates the SHA-256 payload digest and Ed25519 signature of an inbound task frame.
+func (c *Client) VerifyTaskDispatch(task TaskDispatchFrame) error {
+	return agentCrypto.VerifyTaskDispatch(
+		c.signingPubKey,
+		task.TaskID,
+		task.Command,
+		task.TimeoutSec,
+		task.PayloadSHA256,
+		task.Signature,
+	)
+}
+
+// handleTaskDispatch verifies the Ed25519 signature before streaming execution output live.
+// Unsigned or tampered scripts are dropped immediately without execution.
 func (c *Client) handleTaskDispatch(task TaskDispatchFrame) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[-] [Task] Recovered from execution panic on TaskID [%s]: %v", task.TaskID, r)
 		}
 	}()
+
+	if err := c.VerifyTaskDispatch(task); err != nil {
+		log.Printf("[!] [Security] Dropped unsigned or tampered task dispatch [%s]: %v", task.TaskID, err)
+		return
+	}
 
 	timeout := defaultTimeout
 	if task.TimeoutSec > 0 {

@@ -9,6 +9,10 @@ class TaskDispatchFrame(BaseModel):
     task_id: UUID
     command: str = Field(..., min_length=1, description="Shell command string to execute")
     timeout_sec: int = Field(default=30, gt=0, description="Execution timeout budget in seconds")
+    payload_sha256: Optional[str] = Field(
+        default=None,
+        description="Hex-encoded SHA-256 digest over <task_id>:<timeout_sec>:<command>",
+    )
     signature: Optional[str] = Field(
         default=None,
         description="Base64-encoded Ed25519 signature over <task_id>:<timeout_sec>:<command>",

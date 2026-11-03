@@ -1,10 +1,12 @@
 package ws
 
 type TaskDispatchFrame struct {
-	Type       string `json:"type"`
-	TaskID     string `json:"task_id"`
-	Command    string `json:"command"`
-	TimeoutSec int    `json:"timeout_sec"`
+	Type          string `json:"type"`
+	TaskID        string `json:"task_id"`
+	Command       string `json:"command"`
+	TimeoutSec    int    `json:"timeout_sec"`
+	PayloadSHA256 string `json:"payload_sha256,omitempty"`
+	Signature     string `json:"signature,omitempty"`
 }
 
 type TaskStreamFrame struct {

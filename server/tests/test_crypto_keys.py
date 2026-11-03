@@ -223,9 +223,11 @@ def test_crypto_key_endpoints_enrollment_and_signed_task_dispatch():
                 assert task_resp.status_code == 202
                 c2_frame = agent_ws.receive_json()
                 assert c2_frame["type"] == "task_dispatch"
+                assert c2_frame["payload_sha256"] is not None
+                assert len(c2_frame["payload_sha256"]) == 64
                 assert c2_frame["signature"] is not None
 
-                # Agent verifies the incoming task signature using its pinned public key from enrollment
+                # Agent verifies the incoming task signature and SHA-256 digest using its pinned public key
                 assert (
                     verify_task_dispatch(
                         task_id=c2_frame["task_id"],
@@ -233,11 +235,12 @@ def test_crypto_key_endpoints_enrollment_and_signed_task_dispatch():
                         timeout_sec=c2_frame["timeout_sec"],
                         signature_b64=c2_frame["signature"],
                         public_key=agent_verify_pub_b64,
+                        payload_sha256=c2_frame["payload_sha256"],
                     )
                     is True
                 )
 
-                # If an attacker modifies the command in transit, verification fails
+                # If an attacker modifies the command or digest in transit, verification fails
                 assert (
                     verify_task_dispatch(
                         task_id=c2_frame["task_id"],
@@ -245,6 +248,7 @@ def test_crypto_key_endpoints_enrollment_and_signed_task_dispatch():
                         timeout_sec=c2_frame["timeout_sec"],
                         signature_b64=c2_frame["signature"],
                         public_key=agent_verify_pub_b64,
+                        payload_sha256=c2_frame["payload_sha256"],
                     )
                     is False
                 )

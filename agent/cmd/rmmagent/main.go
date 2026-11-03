@@ -139,11 +139,12 @@ func bootstrapEnrollment(serverURL, token, caCertPath, configPath string) error 
 	}
 
 	agentCfg := &config.AgentConfig{
-		ServerURL:    serverURL,
-		AgentID:      enrollResp.ID,
-		APIKey:       enrollResp.APIKey,
-		CACertPath:   caCertPath,
-		HardwareUUID: hostInfo.HardwareUUID,
+		ServerURL:        serverURL,
+		AgentID:          enrollResp.ID,
+		APIKey:           enrollResp.APIKey,
+		CACertPath:       caCertPath,
+		HardwareUUID:     hostInfo.HardwareUUID,
+		SigningPublicKey: enrollResp.SigningPublicKey,
 	}
 
 	if err := config.SaveConfig(agentCfg, resolvedPath); err != nil {
@@ -168,11 +169,22 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 		effectiveCACert = caCertPath
 	}
 
+	if strings.TrimSpace(agentCfg.SigningPublicKey) == "" {
+		if enrollClient, err := client.NewEnrollmentClient(agentCfg.ServerURL, effectiveCACert, 10*time.Second); err == nil {
+			if pubResp, fetchErr := enrollClient.FetchServerPublicKey(); fetchErr == nil && pubResp.PublicKeyB64 != "" {
+				agentCfg.SigningPublicKey = pubResp.PublicKeyB64
+				_ = config.SaveConfig(agentCfg, resolvedConfigPath)
+				log.Printf("[+] [Security] Synchronized Ed25519 verification public key (SHA256: %s)", pubResp.FingerprintSHA256)
+			}
+		}
+	}
+
 	wsConfig := ws.Config{
-		ServerURL:  agentCfg.ServerURL,
-		AgentID:    agentCfg.AgentID,
-		APIKey:     agentCfg.APIKey,
-		CACertPath: effectiveCACert,
+		ServerURL:        agentCfg.ServerURL,
+		AgentID:          agentCfg.AgentID,
+		APIKey:           agentCfg.APIKey,
+		CACertPath:       effectiveCACert,
+		SigningPublicKey: agentCfg.SigningPublicKey,
 	}
 
 	wsClient, err := ws.NewClient(wsConfig)
