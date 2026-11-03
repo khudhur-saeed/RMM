@@ -7,10 +7,17 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import compute_task_digest, sign_task_dispatch
-from app.core.security import verify_agent_api_key, verify_operator_token
+from app.core.rbac import (
+    Permission,
+    Principal,
+    ensure_agent_access,
+    require_permissions,
+)
+from app.core.security import verify_agent_api_key
 from app.core.ws_manager import ws_manager
 from app.db.session import get_db
 from app.models.agent import Agent
+from app.models.site import Site
 from app.models.software import InstalledSoftware
 from app.schemas.agent import AgentHeartbeat, AgentRead
 from app.schemas.software import SoftwareRead
@@ -23,14 +30,25 @@ router = APIRouter()
     "",
     response_model=List[AgentRead],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(verify_operator_token)],
     summary="List all registered agents across sites",
 )
 async def list_agents(
+    principal: Principal = Depends(require_permissions(Permission.AGENT_READ)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Retrieves all monitored endpoints registered in the system."""
+    """
+    Retrieves monitored endpoints registered in the system,
+    automatically scoped to the caller's site or organization boundaries.
+    """
     stmt = select(Agent).order_by(Agent.created_at.desc())
+
+    if principal.site_id is not None:
+        stmt = stmt.where(Agent.site_id == principal.site_id)
+    elif principal.org_id is not None:
+        stmt = stmt.join(Site, Agent.site_id == Site.id).where(
+            Site.org_id == principal.org_id
+        )
+
     result = await db.execute(stmt)
     return result.scalars().all()
 
@@ -39,23 +57,15 @@ async def list_agents(
     "/{agent_id}",
     response_model=AgentRead,
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(verify_operator_token)],
     summary="Get single agent metadata by UUID",
 )
 async def get_agent(
     agent_id: UUID,
+    principal: Principal = Depends(require_permissions(Permission.AGENT_READ)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Retrieves metadata for a specific agent node."""
-    stmt = select(Agent).where(Agent.id == agent_id)
-    result = await db.execute(stmt)
-    agent = result.scalar_one_or_none()
-
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found.",
-        )
+    """Retrieves metadata for a specific agent node within the caller's RBAC scope."""
+    agent = await ensure_agent_access(principal, agent_id, db)
     return agent
 
 
@@ -63,7 +73,6 @@ async def get_agent(
     "/{agent_id}/software",
     response_model=List[SoftwareRead],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(verify_operator_token)],
     summary="List and search installed software packages for an agent",
 )
 async def get_agent_software(
@@ -74,19 +83,14 @@ async def get_agent_software(
     ),
     limit: int = Query(default=500, ge=1, le=5000),
     offset: int = Query(default=0, ge=0),
+    principal: Principal = Depends(require_permissions(Permission.AGENT_READ)),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Retrieves the synchronized software inventory for a monitored endpoint,
-    supporting real-time substring search across name, publisher, and version.
+    enforcing site-level RBAC access and supporting substring search.
     """
-    agent_stmt = select(Agent.id).where(Agent.id == agent_id)
-    agent_exists = (await db.execute(agent_stmt)).scalar_one_or_none()
-    if not agent_exists:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found.",
-        )
+    await ensure_agent_access(principal, agent_id, db)
 
     stmt = select(InstalledSoftware).where(InstalledSoftware.agent_id == agent_id)
 
@@ -109,40 +113,47 @@ async def get_agent_software(
     "/{agent_id}/telemetry",
     response_model=Dict[str, Any],
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(verify_operator_token)],
     summary="Get latest cached hardware, network, and heartbeat telemetry for an agent",
 )
 async def get_agent_telemetry(
     agent_id: UUID,
+    principal: Principal = Depends(require_permissions(Permission.AGENT_READ)),
     db: AsyncSession = Depends(get_db),
 ):
     """Retrieves the latest telemetry snapshots cached in Redis for a monitored endpoint."""
-    stmt = select(Agent).where(Agent.id == agent_id)
-    result = await db.execute(stmt)
-    agent = result.scalar_one_or_none()
-
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found.",
-        )
-
+    await ensure_agent_access(principal, agent_id, db)
     return await ws_manager.get_telemetry(agent_id)
 
 
 @router.post(
     "/{agent_id}/tasks",
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(verify_operator_token)],
     summary="Dispatch an asynchronous shell command task to a connected agent",
 )
 async def dispatch_agent_task(
+    request: Request,
     agent_id: UUID,
     command: str,
     timeout_sec: int = 30,
+    principal: Principal = Depends(require_permissions(Permission.AGENT_DISPATCH)),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Routes a signed TaskDispatchFrame over the active agent WebSocket tunnel."""
+    """
+    Routes a signed TaskDispatchFrame over the active agent WebSocket tunnel.
+    Requires `agents:dispatch` permission (SuperAdmin or SiteTechnician) and site access.
+    """
+    request.state.audit_target_agent_id = agent_id
+    request.state.audit_command_text = command
+
+    await ensure_agent_access(
+        principal,
+        agent_id,
+        db,
+        allow_unregistered_for_unscoped=True,
+    )
+
     task_id = uuid4()
+    request.state.audit_task_id = task_id
     payload_sha256 = compute_task_digest(
         task_id=task_id,
         command=command,
@@ -160,8 +171,19 @@ async def dispatch_agent_task(
         payload_sha256=payload_sha256,
         signature=signature,
     )
-    routed = await ws_manager.route_to_agent(agent_id, task_frame.model_dump_json())
+    ws_manager.register_dispatched_task(
+        task_id=task_id,
+        agent_id=agent_id,
+        command_text=command,
+        principal=principal,
+    )
+    routed = await ws_manager.route_to_agent(
+        agent_id,
+        task_frame.model_dump_json(),
+        principal=principal,
+    )
     if not routed:
+        ws_manager.finalize_task_output(task_id)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Target agent is not currently connected to the C2 tunnel.",

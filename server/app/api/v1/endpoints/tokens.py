@@ -7,13 +7,22 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import verify_operator_token
+from app.core.rbac import (
+    Permission,
+    Principal,
+    ensure_site_access,
+    require_permissions,
+)
 from app.db.session import get_db
 from app.models.site import Site
 from app.models.token import EnrollmentToken
-from app.schemas.token import EnrollmentTokenCreate, EnrollmentTokenPublic, EnrollmentTokenRead
+from app.schemas.token import (
+    EnrollmentTokenCreate,
+    EnrollmentTokenPublic,
+    EnrollmentTokenRead,
+)
 
-router = APIRouter(dependencies=[Depends(verify_operator_token)])
+router = APIRouter()
 
 
 @router.post(
@@ -24,28 +33,20 @@ router = APIRouter(dependencies=[Depends(verify_operator_token)])
 )
 async def create_enrollment_token(
     payload: EnrollmentTokenCreate,
+    principal: Principal = Depends(require_permissions(Permission.TOKEN_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Issues a time-limited, cryptographically random token scoped to a target site.
-    Enforces foreign key validation on the parent site.
+    Enforces foreign key validation and site-level RBAC access (`tokens:write`).
     """
-    # 1. Foreign Key Verification: Ensure the target site exists
-    site_query = select(Site).where(Site.id == payload.site_id)
-    site_result = await db.execute(site_query)
-    target_site = site_result.scalar_one_or_none()
+    await ensure_site_access(principal, payload.site_id, db)
 
-    if not target_site:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Target site with ID '{payload.site_id}' not found.",
-        )
-
-    # 2. Cryptographic generation & expiration calculation
     raw_token = secrets.token_urlsafe(32)
-    expiration_timestamp = datetime.now(timezone.utc) + timedelta(hours=payload.valid_hours)
+    expiration_timestamp = datetime.now(timezone.utc) + timedelta(
+        hours=payload.valid_hours
+    )
 
-    # 3. Instantiate and persist the token entity
     new_token = EnrollmentToken(
         token=raw_token,
         site_id=payload.site_id,
@@ -69,12 +70,31 @@ async def list_enrollment_tokens(
         default=None,
         description="Filter tokens by site UUID",
     ),
+    principal: Principal = Depends(require_permissions(Permission.TOKEN_READ)),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Retrieves all generated enrollment tokens, optionally filtered by site identifier.
+    Retrieves enrollment tokens visible to the caller's RBAC scope,
+    optionally filtered by site identifier.
     """
+    if site_id is not None:
+        if not principal.can_access_site(site_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Access denied: role '{principal.role.value}' is not authorized "
+                    f"to inspect tokens for site '{site_id}'."
+                ),
+            )
+
     query = select(EnrollmentToken).order_by(EnrollmentToken.created_at.desc())
+
+    if principal.site_id is not None:
+        query = query.where(EnrollmentToken.site_id == principal.site_id)
+    elif principal.org_id is not None:
+        query = query.join(Site, EnrollmentToken.site_id == Site.id).where(
+            Site.org_id == principal.org_id
+        )
 
     if site_id:
         query = query.where(EnrollmentToken.site_id == site_id)

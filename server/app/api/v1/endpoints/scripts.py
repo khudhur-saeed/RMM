@@ -2,7 +2,7 @@ import re
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,7 +13,12 @@ from app.core.crypto import (
     sign_payload,
     sign_task_dispatch,
 )
-from app.core.security import verify_operator_token
+from app.core.rbac import (
+    Permission,
+    Principal,
+    ensure_agent_access,
+    require_permissions,
+)
 from app.core.ws_manager import ws_manager
 from app.db.session import get_db
 from app.models.script import Script
@@ -28,7 +33,7 @@ from app.schemas.script import (
 )
 from app.schemas.task import TaskDispatchFrame
 
-router = APIRouter(dependencies=[Depends(verify_operator_token)])
+router = APIRouter()
 
 PLACEHOLDER_PATTERN = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
@@ -94,12 +99,10 @@ def _render_script_content(
         else:
             resolved[name] = ""
 
-    # Include any additional runtime values provided by the caller
     for key, val in runtime_values.items():
         if key not in resolved and val is not None:
             resolved[key] = str(val)
 
-    # Check if any placeholder in content is still unresolved
     for match in PLACEHOLDER_PATTERN.finditer(content):
         var_name = match.group(1)
         if var_name not in resolved and var_name not in missing:
@@ -126,6 +129,7 @@ def _render_script_content(
 )
 async def create_script(
     payload: ScriptCreate,
+    _principal: Principal = Depends(require_permissions(Permission.SCRIPT_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
     """Stores a tagged, parameterized script in the PostgreSQL Script Keystore."""
@@ -175,6 +179,7 @@ async def list_scripts(
     ),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
+    _principal: Principal = Depends(require_permissions(Permission.SCRIPT_READ)),
     db: AsyncSession = Depends(get_db),
 ):
     """Retrieves stored scripts ordered alphabetically by name."""
@@ -209,6 +214,7 @@ async def list_scripts(
 )
 async def get_script(
     script_id: UUID,
+    _principal: Principal = Depends(require_permissions(Permission.SCRIPT_READ)),
     db: AsyncSession = Depends(get_db),
 ):
     """Retrieves full script content, tags, and parameter metadata by ID."""
@@ -237,6 +243,7 @@ async def get_script(
 async def update_script(
     script_id: UUID,
     payload: ScriptUpdate,
+    _principal: Principal = Depends(require_permissions(Permission.SCRIPT_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
     """Updates script fields, normalizes tags, and refreshes template parameter definitions."""
@@ -263,9 +270,11 @@ async def update_script(
     if "timeout_sec" in update_data and update_data["timeout_sec"] is not None:
         script.timeout_sec = update_data["timeout_sec"]
 
-    # Re-evaluate parameters if content or parameters changed
     if "parameters" in update_data and update_data["parameters"] is not None:
-        declared_params = [ScriptParameter(**p) if isinstance(p, dict) else p for p in payload.parameters or []]
+        declared_params = [
+            ScriptParameter(**p) if isinstance(p, dict) else p
+            for p in payload.parameters or []
+        ]
         script.parameters = _merge_extracted_parameters(script.content, declared_params)
     elif "content" in update_data and update_data["content"] is not None:
         existing_params = [ScriptParameter(**p) for p in (script.parameters or [])]
@@ -291,6 +300,7 @@ async def update_script(
 )
 async def delete_script(
     script_id: UUID,
+    _principal: Principal = Depends(require_permissions(Permission.SCRIPT_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
     """Permanently removes a script from the keystore."""
@@ -314,15 +324,20 @@ async def delete_script(
     summary="Render a parameterized script with runtime values and optionally dispatch to an agent",
 )
 async def render_script(
+    request: Request,
     script_id: UUID,
     payload: ScriptRenderRequest,
+    principal: Principal = Depends(require_permissions(Permission.SCRIPT_EXECUTE)),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Substitutes {{PARAMETER}} placeholders in the stored script using provided runtime values
-    (or declared defaults). If agent_id is supplied, dispatches the rendered script over the
-    live C2 WebSocket tunnel as a TaskDispatchFrame.
+    (or declared defaults). If agent_id is supplied, verifies `agents:dispatch` and site-level
+    RBAC access before dispatching the rendered script over the C2 WebSocket tunnel.
     """
+    if payload.agent_id is not None:
+        request.state.audit_target_agent_id = payload.agent_id
+
     stmt = select(Script).where(Script.id == script_id)
     script = (await db.execute(stmt)).scalar_one_or_none()
     if not script:
@@ -336,12 +351,26 @@ async def render_script(
         parameters=script.parameters or [],
         runtime_values=payload.values,
     )
+    request.state.audit_command_text = rendered_command
 
     dispatched_task_id: Optional[UUID] = None
     payload_sha256: str
     signature: str
     if payload.agent_id is not None:
+        if not principal.has_permission(Permission.AGENT_DISPATCH):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Permission denied: role '{principal.role.value}' cannot dispatch scripts to agents.",
+            )
+        await ensure_agent_access(
+            principal,
+            payload.agent_id,
+            db,
+            allow_unregistered_for_unscoped=True,
+        )
+
         task_id = uuid4()
+        request.state.audit_task_id = task_id
         payload_sha256 = compute_task_digest(
             task_id=task_id,
             command=rendered_command,
@@ -359,11 +388,19 @@ async def render_script(
             payload_sha256=payload_sha256,
             signature=signature,
         )
+        ws_manager.register_dispatched_task(
+            task_id=task_id,
+            agent_id=payload.agent_id,
+            command_text=rendered_command,
+            principal=principal,
+        )
         routed = await ws_manager.route_to_agent(
             payload.agent_id,
             task_frame.model_dump_json(),
+            principal=principal,
         )
         if not routed:
+            ws_manager.finalize_task_output(task_id)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Target agent is not currently connected to the C2 tunnel.",

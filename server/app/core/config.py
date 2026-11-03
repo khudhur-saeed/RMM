@@ -24,6 +24,8 @@ class Settings(BaseSettings):
 
     # Control Plane Operator Authentication
     ADMIN_API_TOKEN: str = "rmm_admin_dev_token_2026"
+    TECHNICIAN_API_TOKEN: Optional[str] = None
+    AUDITOR_API_TOKEN: Optional[str] = None
 
     # Ed25519 Cryptographic Code-Signing Key Configuration
     SIGNING_KEY_DIR: str = ".keys"

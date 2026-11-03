@@ -6,8 +6,10 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from app.api.v1.router import api_v1_router
+from app.core.audit import AuditLogMiddleware
 from app.core.config import settings
 from app.core.crypto import get_signing_keypair
+from app.core.rbac import RBACMiddleware
 from app.db.session import engine
 from app.services.watchdog import run_agent_watchdog
 
@@ -41,7 +43,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 def create_application() -> FastAPI:
     """
     Application factory pattern.
-    Configures API metadata, routers, and lifespan management.
+    Configures API metadata, RBAC & immutable audit middlewares, routers, and lifespan management.
     """
     application = FastAPI(
         title=settings.PROJECT_NAME,
@@ -50,6 +52,10 @@ def create_application() -> FastAPI:
         redoc_url=f"{settings.API_V1_STR}/redoc",
         lifespan=lifespan,
     )
+
+    # Register immutable audit logging middleware (inner) and RBAC enforcement middleware (outer)
+    application.add_middleware(AuditLogMiddleware)
+    application.add_middleware(RBACMiddleware)
 
     # Attach versioned API router aggregation
     application.include_router(

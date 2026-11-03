@@ -6,13 +6,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import verify_operator_token
+from app.core.rbac import Permission, Principal, ensure_org_access, require_permissions
 from app.db.session import get_db
 from app.models.organization import Organization
 from app.models.site import Site
 from app.schemas.site import SiteCreate, SiteRead
 
-router = APIRouter(dependencies=[Depends(verify_operator_token)])
+router = APIRouter()
 
 
 @router.post(
@@ -23,13 +23,15 @@ router = APIRouter(dependencies=[Depends(verify_operator_token)])
 )
 async def create_site(
     payload: SiteCreate,
+    principal: Principal = Depends(require_permissions(Permission.SITE_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Creates a physical or logical site linked to a tenant organization.
-    Enforces foreign key existence and prevents duplicate site names within the same tenant.
+    Restricted to SuperAdmin (`sites:write`).
     """
-    # 1. Foreign Key Verification: Check if parent organization exists
+    ensure_org_access(principal, payload.org_id)
+
     org_query = select(Organization).where(Organization.id == payload.org_id)
     org_result = await db.execute(org_query)
     parent_org = org_result.scalar_one_or_none()
@@ -40,7 +42,6 @@ async def create_site(
             detail=f"Parent organization with ID '{payload.org_id}' not found.",
         )
 
-    # 2. Scope-based uniqueness check: Prevent duplicate site names within the same organization
     site_query = select(Site).where(
         Site.org_id == payload.org_id,
         Site.name == payload.name,
@@ -54,7 +55,6 @@ async def create_site(
             detail=f"Site with name '{payload.name}' already exists in this organization.",
         )
 
-    # 3. Instantiate and persist new Site entity
     new_site = Site(
         name=payload.name,
         org_id=payload.org_id,
@@ -84,12 +84,21 @@ async def list_sites(
         default=None,
         description="Filter sites by parent organization UUID",
     ),
+    principal: Principal = Depends(require_permissions(Permission.SITE_READ)),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Retrieves all sites, optionally scoped to a single organization.
+    Retrieves sites visible to the caller's RBAC scope, optionally filtered by organization.
     """
+    if org_id is not None:
+        ensure_org_access(principal, org_id)
+
     query = select(Site).order_by(Site.created_at.desc())
+
+    if principal.site_id is not None:
+        query = query.where(Site.id == principal.site_id)
+    elif principal.org_id is not None:
+        query = query.where(Site.org_id == principal.org_id)
 
     if org_id:
         query = query.where(Site.org_id == org_id)

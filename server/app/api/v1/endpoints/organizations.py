@@ -5,12 +5,12 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import verify_operator_token
+from app.core.rbac import Permission, Principal, require_permissions
 from app.db.session import get_db
 from app.models.organization import Organization
 from app.schemas.organization import OrganizationCreate, OrganizationRead
 
-router = APIRouter(dependencies=[Depends(verify_operator_token)])
+router = APIRouter()
 
 
 @router.post(
@@ -21,13 +21,14 @@ router = APIRouter(dependencies=[Depends(verify_operator_token)])
 )
 async def create_organization(
     payload: OrganizationCreate,
+    _principal: Principal = Depends(require_permissions(Permission.ORG_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Creates a root tenant organization.
+    Restricted to SuperAdmin (`organizations:write`).
     Enforces business uniqueness on the organization name.
     """
-    # 1. Uniqueness check against PostgreSQL
     query = select(Organization).where(Organization.name == payload.name)
     result = await db.execute(query)
     existing_org = result.scalar_one_or_none()
@@ -38,7 +39,6 @@ async def create_organization(
             detail=f"Organization with name '{payload.name}' already exists.",
         )
 
-    # 2. Instantiate and persist new ORM entity
     new_org = Organization(name=payload.name)
     db.add(new_org)
     try:
@@ -61,12 +61,17 @@ async def create_organization(
     summary="List all tenant organizations",
 )
 async def list_organizations(
+    principal: Principal = Depends(require_permissions(Permission.ORG_READ)),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Retrieves all tenant organizations registered within the platform.
+    Retrieves tenant organizations registered within the platform.
+    Scoped to `principal.org_id` when the caller is bound to a specific tenant.
     """
     query = select(Organization).order_by(Organization.created_at.desc())
+    if principal.org_id is not None:
+        query = query.where(Organization.id == principal.org_id)
+
     result = await db.execute(query)
     organizations = result.scalars().all()
     return organizations

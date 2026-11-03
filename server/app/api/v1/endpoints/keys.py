@@ -1,3 +1,6 @@
+import hashlib
+
+from cryptography.hazmat.primitives import serialization
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.core.crypto import (
@@ -9,7 +12,7 @@ from app.core.crypto import (
     signing_key_manager,
     verify_signature,
 )
-from app.core.security import verify_operator_token
+from app.core.rbac import Permission, Principal, require_permissions
 from app.schemas.crypto import (
     PublicKeyRead,
     SignPayloadRequest,
@@ -49,13 +52,15 @@ async def get_public_verification_key():
     "/rotate",
     response_model=PublicKeyRead,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(verify_operator_token)],
     summary="Generate and persist a new Ed25519 signing keypair",
 )
-async def rotate_signing_key():
+async def rotate_signing_key(
+    _principal: Principal = Depends(require_permissions(Permission.KEY_ROTATE)),
+):
     """
     Generates a fresh Ed25519 private signing key on the server, atomically persists it
     to secure storage, and returns the new agent verification public key.
+    Restricted to SuperAdmin (`keys:rotate`).
     """
     keypair = signing_key_manager.rotate_keypair()
     return _serialize_public_key(keypair)
@@ -65,13 +70,16 @@ async def rotate_signing_key():
     "/sign",
     response_model=SignPayloadResponse,
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(verify_operator_token)],
     summary="Sign a script or task payload using the server's Ed25519 private key",
 )
 async def sign_script_payload(
     request: SignPayloadRequest,
+    _principal: Principal = Depends(require_permissions(Permission.KEY_SIGN)),
 ):
-    """Computes the SHA-256 digest and signs the provided UTF-8 payload string with the server's active Ed25519 private key."""
+    """
+    Computes the SHA-256 digest and signs the provided UTF-8 payload string
+    with the server's active Ed25519 private key (`keys:sign`).
+    """
     keypair = get_signing_keypair()
     digest = compute_payload_digest(request.payload)
     sig_b64 = sign_payload(request.payload, private_key=keypair.private_key)
@@ -88,15 +96,15 @@ async def sign_script_payload(
     "/verify",
     response_model=VerifySignatureResponse,
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(verify_operator_token)],
     summary="Verify an Ed25519 signature using the agent verification public key",
 )
 async def verify_script_signature(
     request: VerifySignatureRequest,
+    _principal: Principal = Depends(require_permissions(Permission.KEY_VERIFY)),
 ):
     """
     Verifies a Base64-encoded Ed25519 signature against the provided payload
-    and either an explicit public key or the server's active verification public key.
+    and either an explicit public key or the server's active verification public key (`keys:verify`).
     """
     if request.public_key:
         try:
@@ -106,15 +114,14 @@ async def verify_script_signature(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=str(exc),
             )
-        # Compute fingerprint of caller-provided public key
-        import hashlib
-        from cryptography.hazmat.primitives import serialization
         raw_pub = pub.public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         )
         fingerprint = hashlib.sha256(raw_pub).hexdigest()
-        is_valid = verify_signature(request.payload, request.signature_b64, public_key=pub)
+        is_valid = verify_signature(
+            request.payload, request.signature_b64, public_key=pub
+        )
     else:
         keypair = get_signing_keypair()
         fingerprint = keypair.fingerprint_sha256

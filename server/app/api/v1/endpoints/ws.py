@@ -1,23 +1,30 @@
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
 import secrets
 import time
-from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, status
 from pydantic import ValidationError
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import _extract_bearer_token, verify_operator_ws_credentials
+from app.core.audit import compute_output_hash, record_audit_log
+from app.core.crypto import compute_task_digest, sign_task_dispatch
+from app.core.rbac import (
+    authenticate_ws_operator,
+    extract_bearer_token,
+    verify_ws_agent_access,
+    verify_ws_dispatch_permission,
+)
 from app.core.ws_manager import ws_manager
 from app.db.session import async_session_factory
 from app.models.agent import Agent
 from app.models.software import InstalledSoftware
-from app.schemas.task import TaskExitFrame, TaskStreamFrame
+from app.schemas.task import TaskDispatchFrame, TaskExitFrame, TaskStreamFrame
 from app.schemas.telemetry import (
     AuthEventPayload,
     HardwareMetricsPayload,
@@ -203,10 +210,13 @@ async def agent_websocket_endpoint(
     token: Optional[str] = Query(default=None),
 ):
     # 1. Extract token from Authorization header (preferred) or query parameter fallback
-    raw_token = _extract_bearer_token(
-        websocket.headers.get("authorization"),
-        websocket.headers.get("x-api-key"),
-    ) or token
+    raw_token = (
+        extract_bearer_token(
+            websocket.headers.get("authorization"),
+            websocket.headers.get("x-api-key"),
+        )
+        or token
+    )
 
     if not raw_token:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -275,9 +285,12 @@ async def agent_websocket_endpoint(
             elif msg_type == "task_stream":
                 try:
                     stream_frame = TaskStreamFrame.model_validate(payload)
+                    ws_manager.append_task_output(stream_frame.task_id, stream_frame.chunk)
                     await ws_manager.route_to_operator(agent_id, stream_frame.chunk)
                 except ValidationError as exc:
-                    logger.warning("Invalid task_stream frame from Agent [%s]: %s", agent_id, exc)
+                    logger.warning(
+                        "Invalid task_stream frame from Agent [%s]: %s", agent_id, exc
+                    )
 
             elif msg_type == "task_exit":
                 try:
@@ -287,8 +300,42 @@ async def agent_websocket_endpoint(
                         f"({exit_frame.elapsed_ms}ms)\r\n"
                     )
                     await ws_manager.route_to_operator(agent_id, summary)
+
+                    task_ctx = ws_manager.finalize_task_output(exit_frame.task_id)
+                    active_op = ws_manager.operator_principals.get(canonical_key)
+                    task_principal = (
+                        task_ctx.get("principal") if task_ctx else None
+                    ) or active_op
+                    cmd_text = (
+                        task_ctx.get("command_text")
+                        if task_ctx and task_ctx.get("command_text")
+                        else f"task:{exit_frame.task_id}"
+                    )
+                    raw_output = (
+                        task_ctx.get("full_output")
+                        if task_ctx and task_ctx.get("full_output")
+                        else summary
+                    )
+                    await record_audit_log(
+                        principal=task_principal,
+                        target_agent_id=agent_id,
+                        task_id=exit_frame.task_id,
+                        action="WS_TASK_COMPLETE",
+                        method="WS",
+                        path=f"/api/v1/ws/agent/{agent_id}",
+                        command_text=cmd_text,
+                        output_hash=compute_output_hash(raw_output),
+                        status_code=200 if exit_frame.exit_code == 0 else 500,
+                        details={
+                            "exit_code": exit_frame.exit_code,
+                            "elapsed_ms": exit_frame.elapsed_ms,
+                            "error": exit_frame.error,
+                        },
+                    )
                 except ValidationError as exc:
-                    logger.warning("Invalid task_exit frame from Agent [%s]: %s", agent_id, exc)
+                    logger.warning(
+                        "Invalid task_exit frame from Agent [%s]: %s", agent_id, exc
+                    )
 
             elif msg_type == "software_inventory":
                 await handle_software_inventory(agent_id, payload)
@@ -311,24 +358,145 @@ async def operator_websocket_endpoint(
     agent_id: UUID,
     token: Optional[str] = Query(default=None),
 ):
-    if not verify_operator_ws_credentials(websocket, query_token=token):
+    # 1. Authenticate operator token and resolve RBAC Principal (`ws:connect`)
+    principal = await authenticate_ws_operator(websocket, query_token=token)
+    if principal is None:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    if not await ws_manager.connect_operator(agent_id, websocket):
+    # 2. Enforce site/organization boundary before accepting the WebSocket
+    if not await verify_ws_agent_access(principal, agent_id):
+        logger.warning(
+            "Operator [%s] (role=%s) denied WebSocket access to Agent [%s] outside site scope.",
+            principal.username,
+            principal.role.value,
+            agent_id,
+        )
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    # 3. Bind operator socket if target agent is online
+    if not await ws_manager.connect_operator(agent_id, websocket, principal=principal):
         await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
         return
 
     try:
         while True:
-            raw_keystroke = await websocket.receive_text()
-            frame = json.dumps(
-                {
-                    "type": "term_in",
-                    "payload": raw_keystroke,
-                }
+            raw_message = await websocket.receive_text()
+
+            # 4. Enforce RBAC permission check on all WebSocket dispatch actions
+            # (Auditor may passively observe agent output, but is forbidden from dispatching input/tasks)
+            if not verify_ws_dispatch_permission(principal):
+                logger.warning(
+                    "Operator [%s] (role=%s) blocked from WebSocket dispatch action on Agent [%s].",
+                    principal.username,
+                    principal.role.value,
+                    agent_id,
+                )
+                err_payload = json.dumps(
+                    {
+                        "type": "error",
+                        "code": status.HTTP_403_FORBIDDEN,
+                        "detail": (
+                            f"Permission denied: role '{principal.role.value}' is not "
+                            "authorized to dispatch commands or terminal input over WebSocket."
+                        ),
+                    }
+                )
+                await record_audit_log(
+                    principal=principal,
+                    target_agent_id=agent_id,
+                    action="WS_DISPATCH_DENIED",
+                    method="WS",
+                    path=f"/api/v1/ws/operator/{agent_id}",
+                    command_text=raw_message,
+                    output_hash=compute_output_hash(err_payload),
+                    status_code=status.HTTP_403_FORBIDDEN,
+                )
+                await websocket.send_text(err_payload)
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+
+            # 5. Parse structured dispatch frames (`task_dispatch` / `term_in`) or fallback to raw keystroke `term_in`
+            outbound_frame: Optional[str] = None
+            audit_action = "WS_TERM_IN"
+            audit_command_text = raw_message
+            audit_task_id: Optional[UUID] = None
+            try:
+                parsed = json.loads(raw_message)
+                if isinstance(parsed, dict) and "type" in parsed:
+                    action_type = parsed.get("type")
+                    if action_type == "task_dispatch":
+                        cmd = str(parsed.get("command") or "").strip()
+                        if not cmd:
+                            continue
+                        timeout_sec = int(parsed.get("timeout_sec") or 30)
+                        raw_tid = parsed.get("task_id")
+                        task_id = UUID(str(raw_tid)) if raw_tid else uuid4()
+                        digest = parsed.get("payload_sha256") or compute_task_digest(
+                            task_id=task_id,
+                            command=cmd,
+                            timeout_sec=timeout_sec,
+                        )
+                        sig = parsed.get("signature") or sign_task_dispatch(
+                            task_id=task_id,
+                            command=cmd,
+                            timeout_sec=timeout_sec,
+                        )
+                        task_frame = TaskDispatchFrame(
+                            task_id=task_id,
+                            command=cmd,
+                            timeout_sec=timeout_sec,
+                            payload_sha256=digest,
+                            signature=sig,
+                        )
+                        outbound_frame = task_frame.model_dump_json()
+                        audit_action = "WS_TASK_DISPATCH"
+                        audit_command_text = cmd
+                        audit_task_id = task_id
+                        ws_manager.register_dispatched_task(
+                            task_id=task_id,
+                            agent_id=agent_id,
+                            command_text=cmd,
+                            principal=principal,
+                        )
+                    elif action_type == "term_in":
+                        term_payload = str(parsed.get("payload") or "")
+                        outbound_frame = json.dumps(
+                            {
+                                "type": "term_in",
+                                "payload": term_payload,
+                            }
+                        )
+                        audit_action = "WS_TERM_IN"
+                        audit_command_text = term_payload
+            except (json.JSONDecodeError, ValueError, TypeError):
+                outbound_frame = None
+
+            if outbound_frame is None:
+                outbound_frame = json.dumps(
+                    {
+                        "type": "term_in",
+                        "payload": raw_message,
+                    }
+                )
+
+            await ws_manager.route_to_agent(
+                agent_id,
+                outbound_frame,
+                principal=principal,
             )
-            await ws_manager.route_to_agent(agent_id, frame)
+            await record_audit_log(
+                principal=principal,
+                target_agent_id=agent_id,
+                task_id=audit_task_id,
+                action=audit_action,
+                method="WS",
+                path=f"/api/v1/ws/operator/{agent_id}",
+                command_text=audit_command_text,
+                output_hash=compute_output_hash(outbound_frame),
+                status_code=200,
+            )
     except WebSocketDisconnect:
         pass
     finally:
