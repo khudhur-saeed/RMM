@@ -14,7 +14,56 @@ type targetKey struct {
 	path string
 }
 
-// ExtractInstalledSoftware scans HKLM, WOW6432Node, and HKCU for installed applications.
+// isSystemOrClassesSID returns true for non-interactive system SIDs or _Classes subkeys under HKEY_USERS.
+func isSystemOrClassesSID(sid string) bool {
+	trimmed := strings.TrimSpace(sid)
+	upper := strings.ToUpper(trimmed)
+	if trimmed == "" ||
+		upper == ".DEFAULT" ||
+		strings.HasSuffix(upper, "_CLASSES") ||
+		upper == "S-1-5-18" ||
+		upper == "S-1-5-19" ||
+		upper == "S-1-5-20" {
+		return true
+	}
+	return false
+}
+
+// enumerateUserUninstallTargets discovers per-user Uninstall registry paths across all loaded
+// interactive user hives under HKEY_USERS so Windows Services running in Session 0 (LocalSystem)
+// do not miss per-user applications installed under %LocalAppData%.
+func enumerateUserUninstallTargets() []targetKey {
+	usersKey, err := registry.OpenKey(registry.USERS, "", registry.ENUMERATE_SUB_KEYS)
+	if err != nil {
+		return nil
+	}
+	defer usersKey.Close()
+
+	sids, err := usersKey.ReadSubKeyNames(-1)
+	if err != nil {
+		return nil
+	}
+
+	var userTargets []targetKey
+	for _, sid := range sids {
+		if isSystemOrClassesSID(sid) {
+			continue
+		}
+		userTargets = append(userTargets,
+			targetKey{
+				hive: registry.USERS,
+				path: sid + `\Software\Microsoft\Windows\CurrentVersion\Uninstall`,
+			},
+			targetKey{
+				hive: registry.USERS,
+				path: sid + `\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall`,
+			},
+		)
+	}
+	return userTargets
+}
+
+// ExtractInstalledSoftware scans HKLM, WOW6432Node, HKCU, and all loaded interactive user hives under HKU.
 func ExtractInstalledSoftware() ([]SoftwareEntry, error) {
 	targets := []targetKey{
 		{
@@ -30,6 +79,7 @@ func ExtractInstalledSoftware() ([]SoftwareEntry, error) {
 			path: `Software\Microsoft\Windows\CurrentVersion\Uninstall`,
 		},
 	}
+	targets = append(targets, enumerateUserUninstallTargets()...)
 
 	seen := make(map[string]struct{})
 	var installed []SoftwareEntry

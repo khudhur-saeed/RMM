@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Union
 from uuid import UUID
 
 from fastapi import Request, Response
+from sqlalchemy import select
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.rbac import (
@@ -15,7 +16,9 @@ from app.core.rbac import (
     resolve_principal_from_token,
 )
 from app.db.session import async_session_factory
+from app.models.agent import Agent
 from app.models.audit_log import AuditLog
+from app.models.site import Site
 
 logger = logging.getLogger("rmm.audit")
 
@@ -23,9 +26,11 @@ _AGENT_PATH_RE = re.compile(
     r"^/api/v1/(?:agents|ws/operator)/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/|$)"
 )
 _HEARTBEAT_PATH_RE = re.compile(r"^/api/v1/agents/[0-9a-fA-F-]+/heartbeat/?$")
+_DOWNLOAD_PATH_RE = re.compile(r"^/api/v1/download/(?:checksums/)?[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+/?$")
 _SKIP_AUDIT_PREFIXES = (
     "/api/v1/health",
     "/api/v1/enroll",
+    "/api/v1/download",
     "/api/v1/keys/public",
     "/api/v1/openapi.json",
     "/api/v1/docs",
@@ -61,6 +66,8 @@ async def record_audit_log(
     admin_id: Optional[UUID] = None,
     admin_username: Optional[str] = None,
     admin_role: Optional[str] = None,
+    org_id: Optional[Union[UUID, str]] = None,
+    site_id: Optional[Union[UUID, str]] = None,
     target_agent_id: Optional[Union[UUID, str]] = None,
     task_id: Optional[Union[UUID, str]] = None,
     action: str,
@@ -74,7 +81,8 @@ async def record_audit_log(
     details: Optional[Dict[str, Any]] = None,
 ) -> Optional[AuditLog]:
     """
-    Appends an immutable security audit record into the PostgreSQL `audit_logs` table.
+    Appends an immutable security audit record into the PostgreSQL `audit_logs` table,
+    automatically binding tenant `org_id` and `site_id` metadata.
     """
     try:
         resolved_admin_id = (
@@ -92,27 +100,50 @@ async def record_audit_log(
             or (principal.role.value if principal else None)
             or "SuperAdmin"
         )
+        resolved_org_id = _try_parse_uuid(org_id) or (
+            principal.org_id if principal else None
+        )
+        resolved_site_id = _try_parse_uuid(site_id) or (
+            principal.site_id if principal else None
+        )
         resolved_agent_id = _try_parse_uuid(target_agent_id)
         resolved_task_id = _try_parse_uuid(task_id)
         resolved_hash = output_hash or compute_output_hash(output_content)
 
-        entry = AuditLog(
-            admin_id=resolved_admin_id,
-            admin_username=resolved_username,
-            admin_role=resolved_role,
-            target_agent_id=resolved_agent_id,
-            task_id=resolved_task_id,
-            action=action[:128],
-            method=method[:16],
-            path=path[:255],
-            command_text=command_text or "",
-            output_hash=resolved_hash,
-            status_code=status_code,
-            client_ip=client_ip,
-            details=details,
-        )
-
         async with async_session_factory() as session:
+            if resolved_agent_id is not None and (
+                resolved_org_id is None or resolved_site_id is None
+            ):
+                stmt = (
+                    select(Agent.site_id, Site.org_id)
+                    .join(Site, Agent.site_id == Site.id)
+                    .where(Agent.id == resolved_agent_id)
+                )
+                row = (await session.execute(stmt)).first()
+                if row:
+                    if resolved_site_id is None:
+                        resolved_site_id = row[0]
+                    if resolved_org_id is None:
+                        resolved_org_id = row[1]
+
+            entry = AuditLog(
+                admin_id=resolved_admin_id,
+                admin_username=resolved_username,
+                admin_role=resolved_role,
+                org_id=resolved_org_id,
+                site_id=resolved_site_id,
+                target_agent_id=resolved_agent_id,
+                task_id=resolved_task_id,
+                action=action[:128],
+                method=method[:16],
+                path=path[:255],
+                command_text=command_text or "",
+                output_hash=resolved_hash,
+                status_code=status_code,
+                client_ip=client_ip,
+                details=details,
+            )
+
             session.add(entry)
             await session.commit()
             await session.refresh(entry)

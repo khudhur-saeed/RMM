@@ -2,8 +2,11 @@ package client
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -109,6 +112,53 @@ func NewEnrollmentClient(serverURL string, caCertPath string, timeout time.Durat
 			Timeout:   timeout,
 		},
 	}, nil
+}
+
+// ConfigureTLS applies optional mTLS client certificate authentication and leaf/SPKI SHA-256 certificate pinning.
+func (c *EnrollmentClient) ConfigureTLS(clientCertPath, clientKeyPath, certPinSHA256 string) error {
+	transport, ok := c.HTTPClient.Transport.(*http.Transport)
+	if !ok || transport.TLSClientConfig == nil {
+		return fmt.Errorf("enrollment client transport lacks TLS configuration")
+	}
+	tlsConfig := transport.TLSClientConfig
+
+	if clientCertPath != "" || clientKeyPath != "" {
+		if clientCertPath == "" || clientKeyPath == "" {
+			return fmt.Errorf("both clientCertPath and clientKeyPath must be provided for mTLS")
+		}
+		pair, err := tls.LoadX509KeyPair(clientCertPath, clientKeyPath)
+		if err != nil {
+			return fmt.Errorf("failed to load mTLS client keypair: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{pair}
+	}
+
+	pin := strings.ToLower(strings.TrimSpace(strings.ReplaceAll(certPinSHA256, ":", "")))
+	if pin != "" {
+		if _, err := hex.DecodeString(pin); err != nil || len(pin) != 64 {
+			return fmt.Errorf("invalid SHA-256 certificate pin %q: expected 64 hex characters", certPinSHA256)
+		}
+		expectedPin := []byte(pin)
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			for _, raw := range rawCerts {
+				certSum := sha256.Sum256(raw)
+				certHex := []byte(hex.EncodeToString(certSum[:]))
+				if subtle.ConstantTimeCompare(certHex, expectedPin) == 1 {
+					return nil
+				}
+				if parsed, err := x509.ParseCertificate(raw); err == nil {
+					spkiSum := sha256.Sum256(parsed.RawSubjectPublicKeyInfo)
+					spkiHex := []byte(hex.EncodeToString(spkiSum[:]))
+					if subtle.ConstantTimeCompare(spkiHex, expectedPin) == 1 {
+						return nil
+					}
+				}
+			}
+			return fmt.Errorf("TLS certificate pin verification failed: no peer certificate matched pin %s", pin)
+		}
+	}
+
+	return nil
 }
 
 // EnrollEndpoint transmits host telemetry and parses permanent credentials

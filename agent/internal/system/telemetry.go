@@ -1,11 +1,7 @@
 package system
 
 import (
-	"fmt"
-	"os"
 	"runtime"
-	"strconv"
-	"strings"
 )
 
 // TelemetrySnapshot captures instantaneous resource metrics without external dependencies
@@ -37,23 +33,4 @@ func CollectTelemetry() (TelemetrySnapshot, error) {
 		NumGoroutine:  runtime.NumGoroutine(),
 		NumCPU:        runtime.NumCPU(),
 	}, nil
-}
-
-// getSystemUptime reads /proc/uptime on Linux or calculates fallback
-func getSystemUptime() (uint64, error) {
-	if runtime.GOOS == "linux" {
-		data, err := os.ReadFile("/proc/uptime")
-		if err == nil {
-			fields := strings.Fields(string(data))
-			if len(fields) > 0 {
-				uptimeFloat, err := strconv.ParseFloat(fields[0], 64)
-				if err == nil {
-					return uint64(uptimeFloat), nil
-				}
-			}
-		}
-	}
-
-	// Fallback for non-Linux or failed /proc reads: return 0
-	return 0, fmt.Errorf("system uptime collection unsupported or unavailable")
 }

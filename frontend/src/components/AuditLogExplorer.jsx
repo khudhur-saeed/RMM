@@ -13,7 +13,7 @@ export default function AuditLogExplorer({ operatorToken }) {
   // Selected entry for modal view
   const [selectedLog, setSelectedLog] = useState(null);
 
-  const activeToken = operatorToken || sessionStorage.getItem('rmm_operator_token') || 'rmm_admin_dev_token_2026';
+  const activeToken = operatorToken || sessionStorage.getItem('rmm_operator_token') || '';
 
   const fetchLogs = (customAction = actionFilter) => {
     const headers = {

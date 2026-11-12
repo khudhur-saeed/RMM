@@ -40,6 +40,7 @@ _PUBLIC_EXACT_PATHS: FrozenSet[str] = frozenset(
     }
 )
 _AGENT_HEARTBEAT_RE = re.compile(r"^/api/v1/agents/[0-9a-fA-F-]+/heartbeat/?$")
+_DOWNLOAD_PATH_RE = re.compile(r"^/api/v1/download/(?:checksums/)?[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+/?$")
 
 
 @dataclass(frozen=True)
@@ -107,14 +108,20 @@ class Principal:
 def extract_bearer_token(
     authorization: Optional[str],
     x_api_key: Optional[str] = None,
+    sec_websocket_protocol: Optional[str] = None,
 ) -> Optional[str]:
-    """Extracts a bearer token from Authorization header or X-API-Key header."""
+    """Extracts a bearer token from Authorization header, X-API-Key header, or Sec-WebSocket-Protocol header."""
     if authorization:
         scheme, _, param = authorization.partition(" ")
         if scheme.lower() == "bearer" and param.strip():
             return param.strip()
     if x_api_key and x_api_key.strip():
         return x_api_key.strip()
+    if sec_websocket_protocol:
+        for proto in sec_websocket_protocol.split(","):
+            item = proto.strip()
+            if item.lower().startswith("bearer.") and len(item) > 7:
+                return item[7:].strip()
     return None
 
 
@@ -388,11 +395,16 @@ async def authenticate_ws_operator(
 ) -> Optional[Principal]:
     """
     Authenticates an operator WebSocket handshake from Authorization header,
-    X-API-Key header, or `?token=` query parameter, returning the resolved Principal.
+    X-API-Key header, Sec-WebSocket-Protocol subprotocol header, or `?token=` fallback,
+    returning the resolved Principal.
     """
     auth_header = websocket.headers.get("authorization")
     api_key_header = websocket.headers.get("x-api-key")
-    candidate = extract_bearer_token(auth_header, api_key_header) or query_token
+    ws_proto_header = websocket.headers.get("sec-websocket-protocol")
+    candidate = (
+        extract_bearer_token(auth_header, api_key_header, ws_proto_header)
+        or query_token
+    )
     if not candidate:
         return None
 
@@ -523,6 +535,7 @@ class RBACMiddleware(BaseHTTPMiddleware):
             or not path.startswith("/api/v1")
             or path.rstrip("/") in _PUBLIC_EXACT_PATHS
             or _AGENT_HEARTBEAT_RE.match(path)
+            or _DOWNLOAD_PATH_RE.match(path)
         ):
             return await call_next(request)
 

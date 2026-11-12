@@ -79,7 +79,45 @@ async def sign_script_payload(
     """
     Computes the SHA-256 digest and signs the provided UTF-8 payload string
     with the server's active Ed25519 private key (`keys:sign`).
+    Direct signing of C2 task dispatch envelopes is prohibited to prevent forgery.
     """
+    # Guard against using /keys/sign as an arbitrary task dispatch or terminal forgery oracle
+    stripped_payload = request.payload.strip()
+    if stripped_payload.lower().startswith("term_in:"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Direct signing of C2 terminal envelopes via /keys/sign is prohibited.",
+        )
+
+    parts7 = stripped_payload.split(":", 6)
+    if len(parts7) == 7:
+        try:
+            from uuid import UUID as _UUID
+            _UUID(parts7[0])
+            _UUID(parts7[1])
+            int(parts7[2])
+            int(parts7[3])
+            int(parts7[5])
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Direct signing of C2 task dispatch envelopes via /keys/sign is prohibited. Dispatch tasks via the agents endpoint.",
+            )
+        except (ValueError, TypeError):
+            pass
+
+    parts = stripped_payload.split(":", 2)
+    if len(parts) == 3:
+        try:
+            from uuid import UUID as _UUID
+            _UUID(parts[0])
+            int(parts[1])
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Direct signing of C2 task dispatch envelopes via /keys/sign is prohibited. Dispatch tasks via the agents endpoint.",
+            )
+        except (ValueError, TypeError):
+            pass
+
     keypair = get_signing_keypair()
     digest = compute_payload_digest(request.payload)
     sig_b64 = sign_payload(request.payload, private_key=keypair.private_key)

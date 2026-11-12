@@ -87,5 +87,7 @@ func persistUUID(uuidVal string) {
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return
 	}
-	_ = os.WriteFile(stateFile, []byte(uuidVal), 0600)
+	if err := os.WriteFile(stateFile, []byte(uuidVal), 0600); err == nil {
+		_ = config.EnforceSecureStoragePermissions(stateFile)
+	}
 }

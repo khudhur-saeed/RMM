@@ -89,6 +89,7 @@ async def _cleanup_rbac_fixture(
     if org_ids:
         await delete_organizations(org_ids)
     await engine.dispose()
+    await engine.dispose()
 
 
 def test_rbac_role_hierarchy_and_permission_matrix():
@@ -155,6 +156,7 @@ def test_rbac_rest_middleware_dependencies_and_websocket_dispatch():
     6. Verifies account deactivation (`is_active=False`) and token rotation.
     """
     fx = asyncio.run(_seed_multi_site_fixture())
+    reset_shared_async_resources()
     created_org_ids: List[uuid.UUID] = [fx["org_id"]]
     created_user_ids: List[uuid.UUID] = []
     created_script_ids: List[uuid.UUID] = []
@@ -502,7 +504,11 @@ def test_rbac_rest_middleware_dependencies_and_websocket_dispatch():
                 ) as tech_ws:
                     tech_ws.send_text("ls -la\n")
                     term_frame = agent_a_ws.receive_json()
-                    assert term_frame == {"type": "term_in", "payload": "ls -la\n"}
+                    assert term_frame["type"] == "term_in"
+                    assert term_frame["payload"] == "ls -la\n"
+                    assert term_frame["agent_id"] == str(fx["agent_a_id"])
+                    assert len(term_frame["signature"]) > 0
+                    assert len(term_frame["nonce"]) >= 16
 
                     tech_ws.send_json(
                         {
@@ -545,7 +551,7 @@ def test_rbac_rest_middleware_dependencies_and_websocket_dispatch():
             disabled_check = client.get("/api/v1/agents", headers=tech_headers)
             assert disabled_check.status_code == 403
     finally:
-        reset_shared_async_resources()
         asyncio.run(
             _cleanup_rbac_fixture(created_org_ids, created_user_ids, created_script_ids)
         )
+        reset_shared_async_resources()

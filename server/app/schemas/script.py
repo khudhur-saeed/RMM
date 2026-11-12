@@ -91,7 +91,14 @@ class ScriptBase(BaseModel):
 
 class ScriptCreate(ScriptBase):
     """Inbound validation schema for creating a new script."""
-    pass
+    org_id: Optional[UUID] = Field(
+        default=None,
+        description="Optional tenant organization UUID scoping this script",
+    )
+    is_system_global: Optional[bool] = Field(
+        default=None,
+        description="Whether this script is shared globally across all tenants",
+    )
 
 
 class ScriptUpdate(BaseModel):
@@ -103,6 +110,7 @@ class ScriptUpdate(BaseModel):
     tags: Optional[List[str]] = None
     parameters: Optional[List[ScriptParameter]] = None
     timeout_sec: Optional[int] = Field(default=None, ge=1, le=3600)
+    is_system_global: Optional[bool] = None
 
     @field_validator("tags")
     @classmethod
@@ -115,6 +123,8 @@ class ScriptUpdate(BaseModel):
 class ScriptRead(ScriptBase):
     """Outbound serialization schema for stored scripts."""
     id: UUID
+    org_id: Optional[UUID] = None
+    is_system_global: bool = True
     created_at: datetime
     updated_at: datetime
 

@@ -34,65 +34,87 @@ export default function HostDetails({ operatorToken }) {
     const activeToken =
       operatorToken ||
       sessionStorage.getItem("rmm_operator_token") ||
-      "rmm_admin_dev_token_2026";
+      "";
 
-    const fetchAgentDetails = () =>
-      fetch(`/api/v1/agents/${encodeURIComponent(id)}`, {
-        headers: {
+    const fetchAgentDetails = async () => {
+      try {
+        const headers = {
           Authorization: `Bearer ${activeToken}`,
-        },
-      })
-        .then((response) => {
-          if (!response.ok)
-            throw new Error(`HTTP error! status: ${response.status}`);
-          return response.json();
-        })
-        .then((data) => {
-          if (cancelled) return;
-          setAgent(data);
-          setError(null);
+        };
+        const [agentRes, telemetryRes] = await Promise.all([
+          fetch(`/api/v1/agents/${encodeURIComponent(id)}`, { headers }),
+          fetch(`/api/v1/agents/${encodeURIComponent(id)}/telemetry`, { headers }),
+        ]);
 
-          // استخلاص الطابع الزمني وتغذية النافذة المنزلقة (بحد أقصى 20 نقطة)
-          const timeStr = new Date().toTimeString().split(" ")[0];
-          const cpuVal =
-            data.cpu_percent !== undefined
-              ? data.cpu_percent
-              : Math.floor(Math.random() * 25) + 15;
-          const memVal =
-            data.memory_percent !== undefined
-              ? data.memory_percent
-              : Math.floor(Math.random() * 15) + 45;
+        if (!agentRes.ok) {
+          throw new Error(`HTTP error! status: ${agentRes.status}`);
+        }
 
-          setTelemetryData((prevData) => {
-            const nextData = [
-              ...prevData,
-              { time: timeStr, cpu: cpuVal, memory: memVal },
-            ];
-            return nextData.slice(-20);
-          });
+        const data = await agentRes.json();
+        const telemetrySnapshot = telemetryRes.ok ? await telemetryRes.json() : null;
+        if (cancelled) return;
 
-          // رصد عتبة استهلاك المعالج وتوليد تنبيه محلي إن تجاوزت الحد
-          if (cpuVal > 85) {
-            setAlerts((prevAlerts) => [
+        setAgent(data);
+        setError(null);
+
+        const hw = telemetrySnapshot?.hardware_telemetry;
+        const rawCpu =
+          hw?.cpu?.usage_percent ??
+          hw?.cpu_percent ??
+          data.cpu_percent ??
+          0;
+        const rawMem =
+          hw?.memory?.used_percent ??
+          hw?.memory_percent ??
+          data.memory_percent ??
+          0;
+
+        const cpuVal = Number(Number(rawCpu).toFixed(1));
+        const memVal = Number(Number(rawMem).toFixed(1));
+        const timeStr = new Date().toTimeString().split(" ")[0];
+
+        setTelemetryData((prevData) => {
+          const nextData = [
+            ...prevData,
+            { time: timeStr, cpu: cpuVal, memory: memVal },
+          ];
+          return nextData.slice(-20);
+        });
+
+        // رصد عتبة استهلاك المعالج وتوليد تنبيه محلي مع منع التكرار وتحديد سقف الذاكرة (50 تنبيهاً كحد أقصى)
+        if (cpuVal > 85) {
+          const nowMs = Date.now();
+          setAlerts((prevAlerts) => {
+            const lastSpike = [...prevAlerts]
+              .reverse()
+              .find((a) => a.category === "CPU_SPIKE");
+            if (
+              lastSpike &&
+              nowMs - new Date(lastSpike.timestamp).getTime() < 60000
+            ) {
+              return prevAlerts;
+            }
+            const nextAlerts = [
               ...prevAlerts,
               {
-                id: `cpu-${Date.now()}`,
+                id: `cpu-${nowMs}`,
                 agent_id: id,
                 category: "CPU_SPIKE",
                 severity: "WARNING",
                 title: "High CPU Utilization Detected",
                 message: `CPU load reached critical threshold: ${cpuVal}%`,
-                timestamp: new Date().toISOString(),
+                timestamp: new Date(nowMs).toISOString(),
               },
-            ]);
-          }
-        })
-        .catch((err) => {
-          if (!cancelled) setError(err.message);
-        })
-        .finally(() => {
-          if (!cancelled) setNow(Date.now());
-        });
+            ];
+            return nextAlerts.slice(-50);
+          });
+        }
+      } catch (err) {
+        if (!cancelled) setError(err.message);
+      } finally {
+        if (!cancelled) setNow(Date.now());
+      }
+    };
 
     fetchAgentDetails();
     const interval = setInterval(fetchAgentDetails, 10000);
@@ -110,7 +132,7 @@ export default function HostDetails({ operatorToken }) {
     const activeToken =
       operatorToken ||
       sessionStorage.getItem("rmm_operator_token") ||
-      "rmm_admin_dev_token_2026";
+      "";
 
     const term = new Terminal({
       cursorBlink: true,
@@ -133,10 +155,13 @@ export default function HostDetails({ operatorToken }) {
       `[RMM Control Plane] Workspace Initialized for Host ID: ${id}`,
     );
 
-    // اعتماد الرابط الديناميكي الأصلي المتوافق مع Vite Proxy والإنتاج
+    // اعتماد الرابط الديناميكي الأصلي مع تمرير رمز المصادقة عبر ترويسة Sec-WebSocket-Protocol بدلاً من عنوان URL
     const wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const wsUrl = `${wsProtocol}://${window.location.host}/api/v1/ws/operator/${encodeURIComponent(id)}?token=${encodeURIComponent(activeToken)}`;
-    const ws = new WebSocket(wsUrl);
+    const wsUrl = `${wsProtocol}://${window.location.host}/api/v1/ws/operator/${encodeURIComponent(id)}`;
+    const wsProtocols = activeToken
+      ? ["rmm.v1", `bearer.${activeToken}`]
+      : ["rmm.v1"];
+    const ws = new WebSocket(wsUrl, wsProtocols);
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -148,6 +173,17 @@ export default function HostDetails({ operatorToken }) {
 
     ws.onmessage = (event) => {
       if (disposed) return;
+      if (typeof event.data === "string" && event.data.startsWith("{")) {
+        try {
+          const parsed = JSON.parse(event.data);
+          if (parsed && parsed.type === "error" && parsed.detail) {
+            term.writeln(`\r\n[!] RBAC / Policy Error (${parsed.code || 403}): ${parsed.detail}`);
+            return;
+          }
+        } catch {
+          // Not a JSON control frame; write raw output
+        }
+      }
       term.write(event.data);
     };
 

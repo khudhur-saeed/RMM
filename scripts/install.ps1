@@ -115,6 +115,26 @@ function Install-AgentBinary {
         try {
             $webClient = New-Object System.Net.WebClient
             $webClient.DownloadFile($downloadUrl, $tmpBinary)
+
+            # Cryptographic SHA-256 integrity verification
+            $checksumUrl = "$ServerUrl/api/v1/download/checksums/windows/amd64"
+            try {
+                $chkResp = (New-Object System.Net.WebClient).DownloadString($checksumUrl)
+                $expectedSha = ($chkResp | ConvertFrom-Json).sha256
+                if ($expectedSha) {
+                    Write-LogInfo "Verifying SHA-256 integrity checksum..."
+                    $actualSha = (Get-FileHash -Path $tmpBinary -Algorithm SHA256).Hash.ToLowerInvariant()
+                    if ($actualSha -ne $expectedSha.ToLowerInvariant()) {
+                        Write-LogError "SHA-256 integrity mismatch! Expected $expectedSha, got $actualSha"
+                        Remove-Item -Path $tmpBinary -Force
+                        exit 1
+                    }
+                    Write-LogSuccess "Binary integrity verified ($actualSha)"
+                }
+            } catch {
+                Write-LogInfo "Checksum verification endpoint unavailable; proceeding with caution."
+            }
+
             Move-Item -Path $tmpBinary -Destination $binaryTarget -Force
         } catch {
             Write-LogError "Failed to retrieve binary artifact from control plane: $_"

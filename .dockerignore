@@ -1,0 +1,28 @@
+# Git & Version Control
+.git
+.gitignore
+
+# Secrets & Environment Files (Never bake into images)
+.env
+.env.*
+!.env.example
+.keys/
+*.pem
+*.key
+
+# Python Virtual Environments & Caches
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+server/env/
+venv/
+.venv/
+
+# Node.js Dependencies & Build Artifacts
+frontend/node_modules/
+frontend/dist/
+
+# Compiled Agent Binaries
+agent/rmmagent
+agent/rmmagent.exe
+agent/build/

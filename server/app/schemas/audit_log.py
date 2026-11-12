@@ -15,6 +15,8 @@ class AuditLogRead(BaseModel):
     admin_id: UUID
     admin_username: str
     admin_role: str
+    org_id: Optional[UUID] = None
+    site_id: Optional[UUID] = None
     target_agent_id: Optional[UUID] = None
     target_agent: Optional[UUID] = None
     task_id: Optional[UUID] = None

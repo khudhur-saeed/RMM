@@ -3,6 +3,8 @@ package fim
 import (
 	"errors"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -13,6 +15,21 @@ var DefaultMonitoredPaths = []string{
 	"/etc/shadow",
 	"/etc/sudoers",
 	"/etc/ssh/sshd_config",
+}
+
+func getDefaultMonitoredPaths() []string {
+	if runtime.GOOS == "windows" {
+		systemRoot := os.Getenv("SystemRoot")
+		if systemRoot == "" {
+			systemRoot = `C:\Windows`
+		}
+		return []string{
+			filepath.Join(systemRoot, "System32", "drivers", "etc", "hosts"),
+			filepath.Join(systemRoot, "System32", "drivers", "etc", "networks"),
+			filepath.Join(systemRoot, "win.ini"),
+		}
+	}
+	return DefaultMonitoredPaths
 }
 
 // Scanner monitors target file paths and detects cryptographic baseline drift.
@@ -26,7 +43,7 @@ type Scanner struct {
 func NewScanner(paths []string) *Scanner {
 	targetPaths := paths
 	if len(targetPaths) == 0 {
-		targetPaths = DefaultMonitoredPaths
+		targetPaths = getDefaultMonitoredPaths()
 	}
 
 	return &Scanner{

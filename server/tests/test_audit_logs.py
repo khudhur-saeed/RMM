@@ -62,6 +62,7 @@ async def _cleanup_audit_fixture(
     org_id: uuid.UUID,
     user_ids: List[uuid.UUID],
     script_ids: List[uuid.UUID],
+    extra_org_ids: List[uuid.UUID] | None = None,
 ) -> None:
     async with async_session_factory() as session:
         if user_ids:
@@ -69,7 +70,8 @@ async def _cleanup_audit_fixture(
         if script_ids:
             await session.execute(delete(Script).where(Script.id.in_(script_ids)))
         await session.commit()
-    await delete_organizations([org_id])
+    orgs = [org_id] + (extra_org_ids or [])
+    await delete_organizations(orgs)
     await engine.dispose()
 
 
@@ -137,6 +139,7 @@ def test_immutable_audit_logging_middleware_and_c2_stream_hashing():
     fx = asyncio.run(_seed_audit_test_fixture())
     user_ids: List[uuid.UUID] = []
     script_ids: List[uuid.UUID] = []
+    extra_org_ids: List[uuid.UUID] = []
     suffix = uuid.uuid4().hex[:6]
 
     sa_headers = {"Authorization": f"Bearer {settings.ADMIN_API_TOKEN}"}
@@ -297,6 +300,43 @@ def test_immutable_audit_logging_middleware_and_c2_stream_hashing():
             tech_audit_resp = client.get("/api/v1/audit-logs", headers=tech_headers)
             assert tech_audit_resp.status_code == 403
 
+            # 5b. Verify tenant isolation: an Auditor scoped to a different Organization cannot view fx["org_id"] logs
+            other_org_resp = client.post(
+                "/api/v1/organizations",
+                headers=sa_headers,
+                json={"name": f"Isolated Audit Org B {suffix}"},
+            )
+            assert other_org_resp.status_code == 201
+            other_org_id = uuid.UUID(other_org_resp.json()["id"])
+            extra_org_ids.append(other_org_id)
+
+            tenant_b_aud_resp = client.post(
+                "/api/v1/users",
+                headers=sa_headers,
+                json={
+                    "username": f"tenant_b_auditor_{suffix}",
+                    "role": "Auditor",
+                    "org_id": str(other_org_id),
+                },
+            )
+            assert tenant_b_aud_resp.status_code == 201
+            tenant_b_aud = tenant_b_aud_resp.json()
+            user_ids.append(uuid.UUID(tenant_b_aud["id"]))
+            tenant_b_headers = {"Authorization": f"Bearer {tenant_b_aud['api_token']}"}
+
+            b_logs_resp = client.get(
+                f"/api/v1/audit-logs?target_agent_id={fx['agent_id']}",
+                headers=tenant_b_headers,
+            )
+            assert b_logs_resp.status_code == 200
+            assert b_logs_resp.json() == []
+
+            b_single_resp = client.get(
+                f"/api/v1/audit-logs/{rest_audit_id}",
+                headers=tenant_b_headers,
+            )
+            assert b_single_resp.status_code == 403
+
             # 6. Verify REST immutability: even SuperAdmin cannot DELETE or PATCH an audit log
             del_attempt = client.delete(
                 f"/api/v1/audit-logs/{rest_audit_id}",
@@ -314,5 +354,5 @@ def test_immutable_audit_logging_middleware_and_c2_stream_hashing():
         reset_shared_async_resources()
         asyncio.run(_verify_orm_and_postgres_immutability(rest_audit_id))
     finally:
+        asyncio.run(_cleanup_audit_fixture(fx["org_id"], user_ids, script_ids, extra_org_ids))
         reset_shared_async_resources()
-        asyncio.run(_cleanup_audit_fixture(fx["org_id"], user_ids, script_ids))

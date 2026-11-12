@@ -4,7 +4,8 @@ import hashlib
 import os
 from pathlib import Path
 import secrets
-from typing import Optional, Union
+import time
+from typing import Any, Dict, Optional, Union
 from uuid import UUID
 
 from cryptography.exceptions import InvalidSignature
@@ -18,6 +19,7 @@ from app.core.config import settings
 
 PRIVATE_KEY_FILENAME = "ed25519_signing.key"
 PUBLIC_KEY_FILENAME = "ed25519_signing.pub"
+MAX_CLOCK_SKEW_SEC = 300
 
 
 @dataclass(frozen=True)
@@ -228,16 +230,59 @@ def get_signing_keypair() -> Ed25519KeyPair:
     return signing_key_manager.get_or_create_keypair()
 
 
+def _has_scope_binding(
+    agent_id: Optional[Union[UUID, str]],
+    issued_at: Optional[int],
+    expires_at: Optional[int],
+    nonce: Optional[str],
+) -> bool:
+    return bool(
+        (agent_id is not None and str(agent_id).strip() != "")
+        or (nonce is not None and str(nonce).strip() != "")
+        or (issued_at is not None and int(issued_at) != 0)
+        or (expires_at is not None and int(expires_at) != 0)
+    )
+
+
 def build_canonical_task_payload(
     task_id: Union[UUID, str],
     command: str,
     timeout_sec: int,
+    agent_id: Optional[Union[UUID, str]] = None,
+    issued_at: Optional[int] = None,
+    expires_at: Optional[int] = None,
+    nonce: Optional[str] = None,
 ) -> bytes:
     """
-    Constructs a deterministic canonical byte sequence for signing C2 task/script dispatches:
-    `<task_id>:<timeout_sec>:<command>` encoded as UTF-8.
+    Constructs a deterministic canonical byte sequence for signing C2 task/script dispatches.
+    When recipient/freshness binding fields are provided:
+    `<agent_id>:<task_id>:<issued_at>:<expires_at>:<nonce>:<timeout_sec>:<command>` encoded as UTF-8.
     """
-    return f"{task_id}:{timeout_sec}:{command}".encode("utf-8")
+    norm_task = str(task_id).strip().lower()
+    if _has_scope_binding(agent_id, issued_at, expires_at, nonce):
+        norm_agent = str(agent_id).strip().lower() if agent_id is not None else ""
+        norm_nonce = str(nonce).strip() if nonce is not None else ""
+        return (
+            f"{norm_agent}:{norm_task}:{int(issued_at or 0)}:{int(expires_at or 0)}:"
+            f"{norm_nonce}:{int(timeout_sec)}:{command}"
+        ).encode("utf-8")
+    return f"{norm_task}:{int(timeout_sec)}:{command}".encode("utf-8")
+
+
+def build_canonical_term_in_payload(
+    agent_id: Union[UUID, str],
+    issued_at: int,
+    expires_at: int,
+    nonce: str,
+    payload: str,
+) -> bytes:
+    """
+    Constructs the domain-separated deterministic byte sequence for signed interactive terminal input:
+    `term_in:<agent_id>:<issued_at>:<expires_at>:<nonce>:<payload>` encoded as UTF-8.
+    """
+    norm_agent = str(agent_id).strip().lower()
+    norm_nonce = str(nonce).strip()
+    return f"term_in:{norm_agent}:{int(issued_at)}:{int(expires_at)}:{norm_nonce}:{payload}".encode("utf-8")
 
 
 def compute_payload_digest(data: Union[bytes, str]) -> str:
@@ -250,9 +295,39 @@ def compute_task_digest(
     task_id: Union[UUID, str],
     command: str,
     timeout_sec: int,
+    agent_id: Optional[Union[UUID, str]] = None,
+    issued_at: Optional[int] = None,
+    expires_at: Optional[int] = None,
+    nonce: Optional[str] = None,
 ) -> str:
     """Computes the lowercase hex-encoded SHA-256 digest of the canonical C2 task payload."""
-    canonical = build_canonical_task_payload(task_id=task_id, command=command, timeout_sec=timeout_sec)
+    canonical = build_canonical_task_payload(
+        task_id=task_id,
+        command=command,
+        timeout_sec=timeout_sec,
+        agent_id=agent_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        nonce=nonce,
+    )
+    return compute_payload_digest(canonical)
+
+
+def compute_term_in_digest(
+    agent_id: Union[UUID, str],
+    issued_at: int,
+    expires_at: int,
+    nonce: str,
+    payload: str,
+) -> str:
+    """Computes the lowercase hex-encoded SHA-256 digest of the canonical terminal input payload."""
+    canonical = build_canonical_term_in_payload(
+        agent_id=agent_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        nonce=nonce,
+        payload=payload,
+    )
     return compute_payload_digest(canonical)
 
 
@@ -312,10 +387,76 @@ def sign_task_dispatch(
     command: str,
     timeout_sec: int,
     private_key: Optional[Union[Ed25519PrivateKey, str]] = None,
+    agent_id: Optional[Union[UUID, str]] = None,
+    issued_at: Optional[int] = None,
+    expires_at: Optional[int] = None,
+    nonce: Optional[str] = None,
 ) -> str:
     """Signs a C2 task/script dispatch frame using the canonical task payload format."""
-    canonical = build_canonical_task_payload(task_id=task_id, command=command, timeout_sec=timeout_sec)
+    canonical = build_canonical_task_payload(
+        task_id=task_id,
+        command=command,
+        timeout_sec=timeout_sec,
+        agent_id=agent_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        nonce=nonce,
+    )
     return sign_payload(canonical, private_key=private_key)
+
+
+def sign_term_in(
+    agent_id: Union[UUID, str],
+    issued_at: int,
+    expires_at: int,
+    nonce: str,
+    payload: str,
+    private_key: Optional[Union[Ed25519PrivateKey, str]] = None,
+) -> str:
+    """Signs an interactive terminal input frame (`term_in`) using the domain-separated canonical payload."""
+    canonical = build_canonical_term_in_payload(
+        agent_id=agent_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        nonce=nonce,
+        payload=payload,
+    )
+    return sign_payload(canonical, private_key=private_key)
+
+
+def build_signed_term_in_frame(
+    agent_id: Union[UUID, str],
+    payload: str,
+    ttl_sec: int = 120,
+) -> Dict[str, Any]:
+    """Builds a complete, cryptographically signed `term_in` frame bound to target agent_id, timestamp, and nonce."""
+    now = int(time.time())
+    expires = now + max(ttl_sec, 60)
+    nonce = secrets.token_hex(16)
+    digest = compute_term_in_digest(
+        agent_id=agent_id,
+        issued_at=now,
+        expires_at=expires,
+        nonce=nonce,
+        payload=payload,
+    )
+    sig = sign_term_in(
+        agent_id=agent_id,
+        issued_at=now,
+        expires_at=expires,
+        nonce=nonce,
+        payload=payload,
+    )
+    return {
+        "type": "term_in",
+        "agent_id": str(agent_id),
+        "issued_at": now,
+        "expires_at": expires,
+        "nonce": nonce,
+        "payload": payload,
+        "payload_sha256": digest,
+        "signature": sig,
+    }
 
 
 def verify_task_dispatch(
@@ -325,12 +466,46 @@ def verify_task_dispatch(
     signature_b64: str,
     public_key: Optional[Union[Ed25519PublicKey, str]] = None,
     payload_sha256: Optional[str] = None,
+    agent_id: Optional[Union[UUID, str]] = None,
+    expected_agent_id: Optional[Union[UUID, str]] = None,
+    issued_at: Optional[int] = None,
+    expires_at: Optional[int] = None,
+    nonce: Optional[str] = None,
+    enforce_freshness: bool = False,
 ) -> bool:
     """
-    Verifies an Ed25519 signature (and optional SHA-256 payload digest)
-    on a C2 task/script dispatch frame.
+    Verifies an Ed25519 signature, SHA-256 payload digest, recipient agent binding,
+    and timestamp freshness on a C2 task/script dispatch frame.
     """
-    canonical = build_canonical_task_payload(task_id=task_id, command=command, timeout_sec=timeout_sec)
+    if expected_agent_id is not None:
+        if agent_id is None:
+            return False
+        if not secrets.compare_digest(
+            str(agent_id).strip().lower(),
+            str(expected_agent_id).strip().lower(),
+        ):
+            return False
+
+    if enforce_freshness or (issued_at is not None and int(issued_at) != 0) or (expires_at is not None and int(expires_at) != 0):
+        now = int(time.time())
+        iss = int(issued_at or 0)
+        exp = int(expires_at or 0)
+        if iss <= 0 or exp <= 0 or exp < iss:
+            return False
+        if iss > now + MAX_CLOCK_SKEW_SEC or now > exp + MAX_CLOCK_SKEW_SEC:
+            return False
+        if not nonce or not str(nonce).strip():
+            return False
+
+    canonical = build_canonical_task_payload(
+        task_id=task_id,
+        command=command,
+        timeout_sec=timeout_sec,
+        agent_id=agent_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        nonce=nonce,
+    )
     if payload_sha256 is not None:
         expected_digest = compute_payload_digest(canonical)
         if not secrets.compare_digest(payload_sha256.strip().lower(), expected_digest):

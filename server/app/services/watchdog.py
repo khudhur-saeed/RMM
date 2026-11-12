@@ -37,7 +37,7 @@ async def evaluate_lapsed_agents(
         stale_agents = result.scalars().all()
 
         for agent in stale_agents:
-            redis_key = f"agent:{agent.id}:status"
+            redis_key = f"agent:{str(agent.id).lower()}:status"
             cached_status = await ws_manager.redis_client.get(redis_key)
 
             # If Redis confirms no active TTL/presence, evict state and register offline event

@@ -21,7 +21,7 @@ export default function UserManagement({ operatorToken }) {
   // State for token rotation popup
   const [rotatedTokenInfo, setRotatedTokenInfo] = useState(null);
 
-  const activeToken = operatorToken || sessionStorage.getItem('rmm_operator_token') || 'rmm_admin_dev_token_2026';
+  const activeToken = operatorToken || sessionStorage.getItem('rmm_operator_token') || '';
 
   const loadData = () => {
     const headers = {

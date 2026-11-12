@@ -101,7 +101,7 @@ async def list_rbac_roles(
 )
 async def create_user(
     payload: UserCreate,
-    _principal: Principal = Depends(require_permissions(Permission.USER_WRITE)),
+    principal: Principal = Depends(require_permissions(Permission.USER_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -132,6 +132,17 @@ async def create_user(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Organization with ID '{resolved_org_id}' not found.",
             )
+
+    if principal.org_id is not None and resolved_org_id != principal.org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: cannot provision user outside your organization scope.",
+        )
+    if principal.site_id is not None and payload.site_id != principal.site_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: cannot provision user outside your site scope.",
+        )
 
     raw_token, token_hash = generate_user_api_token()
 
@@ -215,6 +226,11 @@ async def get_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied to user outside your organization scope.",
         )
+    if principal.site_id is not None and user.site_id != principal.site_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied to user outside your site scope.",
+        )
     return _serialize_user(user)
 
 
@@ -233,7 +249,7 @@ async def get_user(
 async def update_user(
     user_id: UUID,
     payload: UserUpdate,
-    _principal: Principal = Depends(require_permissions(Permission.USER_WRITE)),
+    principal: Principal = Depends(require_permissions(Permission.USER_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
     """Updates role assignment, site/organization scope, or active status for an operator."""
@@ -245,6 +261,17 @@ async def update_user(
             detail="User not found.",
         )
 
+    if principal.org_id is not None and user.org_id != principal.org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied to user outside your organization scope.",
+        )
+    if principal.site_id is not None and user.site_id != principal.site_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied to user outside your site scope.",
+        )
+
     update_data = payload.model_dump(exclude_unset=True)
 
     if "site_id" in update_data and update_data["site_id"] is not None:
@@ -254,6 +281,11 @@ async def update_user(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Site with ID '{update_data['site_id']}' not found.",
+            )
+        if "org_id" in update_data and update_data["org_id"] is not None and update_data["org_id"] != site.org_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Provided site_id does not belong to the specified org_id.",
             )
         user.site_id = site.id
         user.org_id = site.org_id
@@ -269,7 +301,20 @@ async def update_user(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"Organization with ID '{update_data['org_id']}' not found.",
                 )
+        if user.site_id is not None and update_data["org_id"] != user.org_id:
+            user.site_id = None
         user.org_id = update_data["org_id"]
+
+    if principal.org_id is not None and user.org_id != principal.org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: cannot reassign user outside your organization scope.",
+        )
+    if principal.site_id is not None and user.site_id != principal.site_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: cannot reassign user outside your site scope.",
+        )
 
     if "role" in update_data and update_data["role"] is not None:
         role_val = update_data["role"]
@@ -302,7 +347,7 @@ async def update_user(
 )
 async def rotate_user_token(
     user_id: UUID,
-    _principal: Principal = Depends(require_permissions(Permission.USER_WRITE)),
+    principal: Principal = Depends(require_permissions(Permission.USER_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
     """Generates a fresh bearer token for the user and invalidates the previous token."""
@@ -312,6 +357,17 @@ async def rotate_user_token(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found.",
+        )
+
+    if principal.org_id is not None and user.org_id != principal.org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied to user outside your organization scope.",
+        )
+    if principal.site_id is not None and user.site_id != principal.site_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied to user outside your site scope.",
         )
 
     raw_token, token_hash = generate_user_api_token()
@@ -328,7 +384,7 @@ async def rotate_user_token(
 )
 async def delete_user(
     user_id: UUID,
-    _principal: Principal = Depends(require_permissions(Permission.USER_WRITE)),
+    principal: Principal = Depends(require_permissions(Permission.USER_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
     """Permanently removes an operator user account from the system."""
@@ -338,6 +394,17 @@ async def delete_user(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="User not found.",
+        )
+
+    if principal.org_id is not None and user.org_id != principal.org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied to user outside your organization scope.",
+        )
+    if principal.site_id is not None and user.site_id != principal.site_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied to user outside your site scope.",
         )
 
     await db.delete(user)

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/creack/pty"
@@ -42,7 +43,16 @@ func resolveInteractiveShell() string {
 // NewSession spawns an interactive shell inside a newly allocated PTY.
 func NewSession() (*Session, error) {
 	shellPath := resolveInteractiveShell()
-	cmd := exec.Command(shellPath, "-i")
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		if strings.Contains(strings.ToLower(shellPath), "powershell") {
+			cmd = exec.Command(shellPath, "-NoLogo")
+		} else {
+			cmd = exec.Command(shellPath)
+		}
+	} else {
+		cmd = exec.Command(shellPath, "-i")
+	}
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
 
 	ptmx, err := pty.Start(cmd)

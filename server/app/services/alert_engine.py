@@ -79,6 +79,12 @@ class AlertEvaluator:
                 ts for ts in self.failed_login_tracker[key] if ts > cutoff
             ]
 
+            # Bound total dictionary keys to prevent memory creep under IP-spoofing attacks
+            if len(self.failed_login_tracker) > 5000:
+                stale_keys = [k for k, v in list(self.failed_login_tracker.items()) if not v or max(v) < cutoff]
+                for k in stale_keys:
+                    self.failed_login_tracker.pop(k, None)
+
             # Record current failure
             self.failed_login_tracker[key].append(now)
 

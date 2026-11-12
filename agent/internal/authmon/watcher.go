@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"io"
 	"os"
+	"strings"
 )
 
 // Default paths for Linux authentication logs across distributions.
@@ -67,6 +68,10 @@ func (w *Watcher) ReadNewEvents() ([]AuthEvent, error) {
 	for {
 		line, readErr := reader.ReadString('\n')
 		if len(line) > 0 {
+			// Do not advance offset across a partial line at EOF that lacks a trailing newline yet
+			if readErr == io.EOF && !strings.HasSuffix(line, "\n") {
+				break
+			}
 			currentOffset += int64(len(line))
 			if event, matched := ParseAuthLine(line); matched {
 				events = append(events, *event)

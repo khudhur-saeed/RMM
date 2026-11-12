@@ -3,8 +3,11 @@ package ws
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,27 +21,31 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-
 	agentCrypto "tactical-rmm/agent/internal/crypto"
 	agentExec "tactical-rmm/agent/internal/exec"
 	"tactical-rmm/agent/internal/terminal"
 )
 
 const (
-	writeWait      = 10 * time.Second
-	pongWait       = 60 * time.Second
-	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 512 * 1024 // 512 KB
-	defaultTimeout = 30 * time.Second
+	writeWait          = 10 * time.Second
+	pongWait           = 60 * time.Second
+	pingPeriod         = (pongWait * 9) / 10
+	maxMessageSize     = 512 * 1024 // 512 KB
+	defaultTimeout     = 30 * time.Second
+	outboundBufferSize = 1024
+	priorityBufferSize = 256
 )
 
-// Config defines connection parameters for the WebSocket client.
+// Config defines connection and cryptographic pinning parameters for the WebSocket client.
 type Config struct {
-	ServerURL        string
-	AgentID          string
-	APIKey           string
-	CACertPath       string
-	SigningPublicKey string
+	ServerURL           string
+	AgentID             string
+	APIKey              string
+	CACertPath          string
+	ClientCertPath      string
+	ClientKeyPath       string
+	ServerCertPinSHA256 string
+	SigningPublicKey    string
 }
 
 // InboundEnvelope defines the generic discriminator for demultiplexing incoming frames.
@@ -51,10 +58,12 @@ type InboundEnvelope struct {
 type Client struct {
 	config        Config
 	signingPubKey ed25519.PublicKey
+	replayCache   *agentCrypto.ReplayCache
 	dialer        websocket.Dialer
 	conn          *websocket.Conn
 	connMutex     sync.Mutex
 	outboundChan  chan []byte
+	priorityChan  chan []byte
 
 	// PTY Interactive Session Management
 	termSession *terminal.Session
@@ -79,7 +88,38 @@ func isLoopbackHost(host string) bool {
 	return false
 }
 
-// NewClient initializes the WebSocket client enforcing TLS 1.3 and Root CA verification.
+// VerifyPinnedPeerCert validates that at least one certificate in the server chain matches
+// the expected SHA-256 hex digest (comparing both leaf raw DER and SPKI SHA-256 digests).
+func VerifyPinnedPeerCert(rawCerts [][]byte, expectedPinHex string) error {
+	cleanPin := strings.ToLower(strings.TrimSpace(expectedPinHex))
+	if cleanPin == "" {
+		return nil
+	}
+	if len(rawCerts) == 0 {
+		return errors.New("TLS certificate pinning failed: peer presented no certificates")
+	}
+
+	for _, rawCert := range rawCerts {
+		leafSum := sha256.Sum256(rawCert)
+		leafHex := hex.EncodeToString(leafSum[:])
+		if subtle.ConstantTimeCompare([]byte(leafHex), []byte(cleanPin)) == 1 {
+			return nil
+		}
+
+		if parsed, err := x509.ParseCertificate(rawCert); err == nil {
+			spkiSum := sha256.Sum256(parsed.RawSubjectPublicKeyInfo)
+			spkiHex := hex.EncodeToString(spkiSum[:])
+			if subtle.ConstantTimeCompare([]byte(spkiHex), []byte(cleanPin)) == 1 {
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("TLS certificate pinning failed: server certificate does not match pinned SHA-256 digest %s", cleanPin)
+}
+
+// NewClient initializes the WebSocket client enforcing TLS 1.3, optional mTLS client certs,
+// custom Root CA verification, and optional SPKI/certificate SHA-256 pinning.
 func NewClient(cfg Config) (*Client, error) {
 	tlsConfig := &tls.Config{
 		MinVersion: tls.VersionTLS13,
@@ -98,6 +138,24 @@ func NewClient(cfg Config) (*Client, error) {
 		tlsConfig.RootCAs = caCertPool
 	}
 
+	if cfg.ClientCertPath != "" || cfg.ClientKeyPath != "" {
+		if cfg.ClientCertPath == "" || cfg.ClientKeyPath == "" {
+			return nil, errors.New("mTLS configuration requires both client_cert_path and client_key_path")
+		}
+		clientCert, err := tls.LoadX509KeyPair(cfg.ClientCertPath, cfg.ClientKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load mTLS client certificate keypair: %w", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{clientCert}
+	}
+
+	if strings.TrimSpace(cfg.ServerCertPinSHA256) != "" {
+		expectedPin := strings.ToLower(strings.TrimSpace(cfg.ServerCertPinSHA256))
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			return VerifyPinnedPeerCert(rawCerts, expectedPin)
+		}
+	}
+
 	var parsedPubKey ed25519.PublicKey
 	if strings.TrimSpace(cfg.SigningPublicKey) != "" {
 		pub, err := agentCrypto.ParseEd25519PublicKey(cfg.SigningPublicKey)
@@ -110,11 +168,13 @@ func NewClient(cfg Config) (*Client, error) {
 	return &Client{
 		config:        cfg,
 		signingPubKey: parsedPubKey,
+		replayCache:   agentCrypto.NewReplayCache(agentCrypto.DefaultReplayCacheCapacity),
 		dialer: websocket.Dialer{
 			TLSClientConfig:  tlsConfig,
 			HandshakeTimeout: 15 * time.Second,
 		},
-		outboundChan: make(chan []byte, 128),
+		outboundChan: make(chan []byte, outboundBufferSize),
+		priorityChan: make(chan []byte, priorityBufferSize),
 	}, nil
 }
 
@@ -160,7 +220,40 @@ func (c *Client) Send(payload []byte) bool {
 	case c.outboundChan <- payload:
 		return true
 	default:
-		log.Println("[-] [WS] Outbound buffer saturated; frame dropped")
+		select {
+		case c.priorityChan <- payload:
+			return true
+		default:
+			log.Println("[-] [WS] Outbound and priority buffers saturated; frame dropped")
+			return false
+		}
+	}
+}
+
+// SendPriority queues critical security telemetry or task completion frames with a fallback
+// priority queue and short backpressure wait so high-severity frames are not lost during bursts.
+func (c *Client) SendPriority(payload []byte) bool {
+	c.connMutex.Lock()
+	closed := c.isClosed
+	c.connMutex.Unlock()
+
+	if closed {
+		return false
+	}
+
+	select {
+	case c.outboundChan <- payload:
+		return true
+	default:
+	}
+
+	select {
+	case c.priorityChan <- payload:
+		return true
+	case c.outboundChan <- payload:
+		return true
+	case <-time.After(500 * time.Millisecond):
+		log.Println("[-] [WS] Priority buffer timed out under extreme backpressure")
 		return false
 	}
 }
@@ -254,18 +347,38 @@ func (c *Client) writePump(ctx context.Context, conn *websocket.Conn) {
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
 
+	writeFrame := func(payload []byte) bool {
+		_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
+		if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+			log.Printf("[-] [WS] Socket write error: %v", err)
+			_ = conn.Close()
+			return false
+		}
+		return true
+	}
+
 	for {
+		// Always prioritize draining critical frames first if any are queued
 		select {
 		case <-ctx.Done():
 			return
-		case payload, ok := <-c.outboundChan:
-			if !ok {
+		case prioPayload, ok := <-c.priorityChan:
+			if !ok || !writeFrame(prioPayload) {
 				return
 			}
-			_ = conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
-				log.Printf("[-] [WS] Socket write error: %v", err)
-				_ = conn.Close()
+			continue
+		default:
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case prioPayload, ok := <-c.priorityChan:
+			if !ok || !writeFrame(prioPayload) {
+				return
+			}
+		case payload, ok := <-c.outboundChan:
+			if !ok || !writeFrame(payload) {
 				return
 			}
 		case <-ticker.C:
@@ -312,7 +425,10 @@ func (c *Client) readPump(ctx context.Context, conn *websocket.Conn) {
 
 		switch env.Type {
 		case "term_in":
-			c.handleTerminalInput(env.Payload)
+			var termFrame TermInFrame
+			if err := json.Unmarshal(message, &termFrame); err == nil {
+				c.handleSignedTerminalInput(termFrame)
+			}
 		case "task_dispatch":
 			var dispatchFrame TaskDispatchFrame
 			if err := json.Unmarshal(message, &dispatchFrame); err == nil && dispatchFrame.Command != "" {
@@ -323,7 +439,36 @@ func (c *Client) readPump(ctx context.Context, conn *websocket.Conn) {
 	}
 }
 
-// handleTerminalInput manages on-demand PTY allocation and routes keystrokes.
+// VerifyTermIn validates the recipient agent binding, timestamp freshness, anti-replay nonce,
+// SHA-256 digest, and Ed25519 signature of an interactive terminal input frame before allowing PTY execution.
+func (c *Client) VerifyTermIn(frame TermInFrame) error {
+	scope := agentCrypto.TaskScope{
+		AgentID:          frame.AgentID,
+		ExpectedAgentID:  c.config.AgentID,
+		IssuedAt:         frame.IssuedAt,
+		ExpiresAt:        frame.ExpiresAt,
+		Nonce:            frame.Nonce,
+		EnforceFreshness: true,
+		ReplayCache:      c.replayCache,
+	}
+	return agentCrypto.VerifyTermIn(
+		c.signingPubKey,
+		frame.Payload,
+		frame.PayloadSHA256,
+		frame.Signature,
+		scope,
+	)
+}
+
+func (c *Client) handleSignedTerminalInput(frame TermInFrame) {
+	if err := c.VerifyTermIn(frame); err != nil {
+		log.Printf("[!] [Security] Dropped unsigned, expired, or tampered term_in frame: %v", err)
+		return
+	}
+	c.handleTerminalInput(frame.Payload)
+}
+
+// handleTerminalInput manages on-demand PTY allocation and routes cryptographically verified keystrokes.
 func (c *Client) handleTerminalInput(payload string) {
 	c.termMutex.Lock()
 	defer c.termMutex.Unlock()
@@ -339,13 +484,25 @@ func (c *Client) handleTerminalInput(payload string) {
 		log.Println("[+] [PTY] Interactive shell attached to active session.")
 	}
 
-	if err := c.termSession.WriteInput([]byte(payload)); err != nil {
-		log.Printf("[-] [PTY] Error writing keystroke to PTY: %v", err)
+	if c.termSession != nil {
+		if err := c.termSession.WriteInput([]byte(payload)); err != nil {
+			log.Printf("[-] [PTY] Error writing keystroke to PTY: %v", err)
+		}
 	}
 }
 
-// VerifyTaskDispatch validates the SHA-256 payload digest and Ed25519 signature of an inbound task frame.
+// VerifyTaskDispatch validates the recipient agent binding, freshness window, anti-replay nonce,
+// SHA-256 payload digest, and Ed25519 signature of an inbound task frame.
 func (c *Client) VerifyTaskDispatch(task TaskDispatchFrame) error {
+	scope := agentCrypto.TaskScope{
+		AgentID:          task.AgentID,
+		ExpectedAgentID:  c.config.AgentID,
+		IssuedAt:         task.IssuedAt,
+		ExpiresAt:        task.ExpiresAt,
+		Nonce:            task.Nonce,
+		EnforceFreshness: true,
+		ReplayCache:      c.replayCache,
+	}
 	return agentCrypto.VerifyTaskDispatch(
 		c.signingPubKey,
 		task.TaskID,
@@ -353,11 +510,12 @@ func (c *Client) VerifyTaskDispatch(task TaskDispatchFrame) error {
 		task.TimeoutSec,
 		task.PayloadSHA256,
 		task.Signature,
+		scope,
 	)
 }
 
 // handleTaskDispatch verifies the Ed25519 signature before streaming execution output live.
-// Unsigned or tampered scripts are dropped immediately without execution.
+// Unsigned, replayed, or tampered scripts are dropped immediately without execution.
 func (c *Client) handleTaskDispatch(task TaskDispatchFrame) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -366,7 +524,7 @@ func (c *Client) handleTaskDispatch(task TaskDispatchFrame) {
 	}()
 
 	if err := c.VerifyTaskDispatch(task); err != nil {
-		log.Printf("[!] [Security] Dropped unsigned or tampered task dispatch [%s]: %v", task.TaskID, err)
+		log.Printf("[!] [Security] Dropped unsigned, replayed, or tampered task dispatch [%s]: %v", task.TaskID, err)
 		return
 	}
 
@@ -386,7 +544,7 @@ func (c *Client) handleTaskDispatch(task TaskDispatchFrame) {
 			Chunk:  chunk,
 		}
 		if payload, err := json.Marshal(streamFrame); err == nil {
-			c.Send(payload)
+			c.SendPriority(payload)
 		}
 	}
 
@@ -405,7 +563,7 @@ func (c *Client) handleTaskDispatch(task TaskDispatchFrame) {
 	}
 
 	if payload, encErr := json.Marshal(exitFrame); encErr == nil {
-		c.Send(payload)
+		c.SendPriority(payload)
 	}
 
 	log.Printf("[+] [Task] Completed TaskID [%s] (ExitCode: %d, Elapsed: %dms)",

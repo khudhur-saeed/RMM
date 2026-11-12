@@ -127,6 +127,21 @@ install_agent_binary() {
             exit 1
         fi
 
+        # Verify SHA-256 integrity checksum against control plane
+        local checksum_url="${SERVER_URL}/api/v1/download/checksums/linux/${detected_arch}"
+        local expected_sha
+        if expected_sha="$("${curl_cmd[@]}" "${checksum_url}" 2>/dev/null | grep -o '"sha256":"[^"]*' | cut -d'"' -f4)" && [[ -n "${expected_sha}" ]]; then
+            log_info "Verifying cryptographic SHA-256 integrity checksum..."
+            local actual_sha
+            actual_sha="$(sha256sum "${tmp_binary}" | awk '{print $1}')"
+            if [[ "${actual_sha}" != "${expected_sha}" ]]; then
+                log_error "Integrity check failed! Expected ${expected_sha}, got ${actual_sha}"
+                rm -f "${tmp_binary}"
+                exit 1
+            fi
+            log_success "SHA-256 integrity verified (${actual_sha:0:16}...)"
+        fi
+
         mv "${tmp_binary}" "${TARGET_PATH}"
     fi
 

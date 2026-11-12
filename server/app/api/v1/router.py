@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.v1.endpoints import (
     agents,
     audit_logs,
+    download,
     enroll,
     health,
     keys,
@@ -44,6 +45,13 @@ api_v1_router.include_router(
     enroll.router,
     prefix="/enroll",
     tags=["Enrollment"],
+)
+
+# Endpoint Agent Binary Distribution (install.sh & install.ps1)
+api_v1_router.include_router(
+    download.router,
+    prefix="/download",
+    tags=["Agent Downloads"],
 )
 
 # Operational Telemetry & Fleet Management

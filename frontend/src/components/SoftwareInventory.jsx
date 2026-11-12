@@ -14,7 +14,7 @@ export default function SoftwareInventory({ agentId, operatorToken }) {
       const activeToken =
         operatorToken ||
         sessionStorage.getItem('rmm_operator_token') ||
-        'rmm_admin_dev_token_2026';
+        '';
 
       const params = new URLSearchParams();
       if (searchQuery.trim()) {

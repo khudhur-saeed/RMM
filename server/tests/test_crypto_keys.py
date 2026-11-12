@@ -227,7 +227,7 @@ def test_crypto_key_endpoints_enrollment_and_signed_task_dispatch():
                 assert len(c2_frame["payload_sha256"]) == 64
                 assert c2_frame["signature"] is not None
 
-                # Agent verifies the incoming task signature and SHA-256 digest using its pinned public key
+                # Agent verifies the incoming task signature, recipient binding, freshness, and SHA-256 digest
                 assert (
                     verify_task_dispatch(
                         task_id=c2_frame["task_id"],
@@ -236,8 +236,33 @@ def test_crypto_key_endpoints_enrollment_and_signed_task_dispatch():
                         signature_b64=c2_frame["signature"],
                         public_key=agent_verify_pub_b64,
                         payload_sha256=c2_frame["payload_sha256"],
+                        agent_id=c2_frame["agent_id"],
+                        expected_agent_id=agent_id,
+                        issued_at=c2_frame["issued_at"],
+                        expires_at=c2_frame["expires_at"],
+                        nonce=c2_frame["nonce"],
+                        enforce_freshness=True,
                     )
                     is True
+                )
+
+                # Cross-agent replay (replaying frame signed for agent_id to a different agent) must fail
+                assert (
+                    verify_task_dispatch(
+                        task_id=c2_frame["task_id"],
+                        command=c2_frame["command"],
+                        timeout_sec=c2_frame["timeout_sec"],
+                        signature_b64=c2_frame["signature"],
+                        public_key=agent_verify_pub_b64,
+                        payload_sha256=c2_frame["payload_sha256"],
+                        agent_id=c2_frame["agent_id"],
+                        expected_agent_id=uuid.uuid4(),
+                        issued_at=c2_frame["issued_at"],
+                        expires_at=c2_frame["expires_at"],
+                        nonce=c2_frame["nonce"],
+                        enforce_freshness=True,
+                    )
+                    is False
                 )
 
                 # If an attacker modifies the command or digest in transit, verification fails
@@ -249,6 +274,12 @@ def test_crypto_key_endpoints_enrollment_and_signed_task_dispatch():
                         signature_b64=c2_frame["signature"],
                         public_key=agent_verify_pub_b64,
                         payload_sha256=c2_frame["payload_sha256"],
+                        agent_id=c2_frame["agent_id"],
+                        expected_agent_id=agent_id,
+                        issued_at=c2_frame["issued_at"],
+                        expires_at=c2_frame["expires_at"],
+                        nonce=c2_frame["nonce"],
+                        enforce_freshness=True,
                     )
                     is False
                 )

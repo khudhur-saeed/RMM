@@ -13,7 +13,11 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.audit import compute_output_hash, record_audit_log
-from app.core.crypto import compute_task_digest, sign_task_dispatch
+from app.core.crypto import (
+    build_signed_term_in_frame,
+    compute_task_digest,
+    sign_task_dispatch,
+)
 from app.core.rbac import (
     authenticate_ws_operator,
     extract_bearer_token,
@@ -174,7 +178,7 @@ async def process_telemetry_frame(agent_id: UUID, payload: dict) -> None:
                     f"Category: {alert.category.value} | Title: {alert.title} | {alert.message}"
                 )
 
-        elif frame_type in ("auth_event", "security_event_telemetry"):
+        elif frame_type in ("auth_event", "auth_telemetry", "security_event_telemetry"):
             events = payload.get("events", [payload.get("payload", payload)])
             for ev in events:
                 event_type = ev.get("event_type") or (
@@ -195,6 +199,14 @@ async def process_telemetry_frame(agent_id: UUID, payload: dict) -> None:
                         f"Category: {alert.category.value} | Title: {alert.title} | {alert.message}"
                     )
 
+        elif frame_type == "fim_telemetry":
+            alerts = payload.get("alerts", [])
+            for alt in alerts:
+                logger.warning(
+                    f"[ALERT GENERATED] [CRITICAL] Agent {agent_id} | "
+                    f"Category: FIM_DRIFT | File Integrity Deviation on {alt.get('path')} ({alt.get('change_type')})"
+                )
+
     except ValidationError as err:
         logger.debug(f"Telemetry frame schema mismatch from agent {agent_id}: {err}")
     except Exception as exc:
@@ -209,11 +221,12 @@ async def agent_websocket_endpoint(
     agent_id: UUID,
     token: Optional[str] = Query(default=None),
 ):
-    # 1. Extract token from Authorization header (preferred) or query parameter fallback
+    # 1. Extract token from Authorization header, Sec-WebSocket-Protocol, or query parameter fallback
     raw_token = (
         extract_bearer_token(
             websocket.headers.get("authorization"),
             websocket.headers.get("x-api-key"),
+            websocket.headers.get("sec-websocket-protocol"),
         )
         or token
     )
@@ -342,7 +355,7 @@ async def agent_websocket_endpoint(
                 await ws_manager.cache_telemetry(agent_id, msg_type, payload)
 
             else:
-                if msg_type in ("heartbeat", "hardware_telemetry", "network_telemetry"):
+                if msg_type in ("heartbeat", "hardware_telemetry", "network_telemetry", "fim_telemetry"):
                     await ws_manager.cache_telemetry(agent_id, msg_type, payload)
                 await process_telemetry_frame(agent_id, payload)
 
@@ -433,18 +446,34 @@ async def operator_websocket_endpoint(
                         timeout_sec = int(parsed.get("timeout_sec") or 30)
                         raw_tid = parsed.get("task_id")
                         task_id = UUID(str(raw_tid)) if raw_tid else uuid4()
-                        digest = parsed.get("payload_sha256") or compute_task_digest(
+                        issued_at = int(time.time())
+                        expires_at = issued_at + max(300, timeout_sec + 60)
+                        nonce = secrets.token_hex(16)
+                        # Authoritative cryptographic task signing by control plane
+                        digest = compute_task_digest(
                             task_id=task_id,
                             command=cmd,
                             timeout_sec=timeout_sec,
+                            agent_id=agent_id,
+                            issued_at=issued_at,
+                            expires_at=expires_at,
+                            nonce=nonce,
                         )
-                        sig = parsed.get("signature") or sign_task_dispatch(
+                        sig = sign_task_dispatch(
                             task_id=task_id,
                             command=cmd,
                             timeout_sec=timeout_sec,
+                            agent_id=agent_id,
+                            issued_at=issued_at,
+                            expires_at=expires_at,
+                            nonce=nonce,
                         )
                         task_frame = TaskDispatchFrame(
                             task_id=task_id,
+                            agent_id=agent_id,
+                            issued_at=issued_at,
+                            expires_at=expires_at,
+                            nonce=nonce,
                             command=cmd,
                             timeout_sec=timeout_sec,
                             payload_sha256=digest,
@@ -463,10 +492,7 @@ async def operator_websocket_endpoint(
                     elif action_type == "term_in":
                         term_payload = str(parsed.get("payload") or "")
                         outbound_frame = json.dumps(
-                            {
-                                "type": "term_in",
-                                "payload": term_payload,
-                            }
+                            build_signed_term_in_frame(agent_id, term_payload)
                         )
                         audit_action = "WS_TERM_IN"
                         audit_command_text = term_payload
@@ -475,10 +501,7 @@ async def operator_websocket_endpoint(
 
             if outbound_frame is None:
                 outbound_frame = json.dumps(
-                    {
-                        "type": "term_in",
-                        "payload": raw_message,
-                    }
+                    build_signed_term_in_frame(agent_id, raw_message)
                 )
 
             await ws_manager.route_to_agent(

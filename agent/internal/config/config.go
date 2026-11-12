@@ -46,12 +46,16 @@ func ResolveConfigPath(explicitPath string) string {
 
 // AgentConfig represents the persistent cryptographic identity and C2 parameters.
 type AgentConfig struct {
-	ServerURL        string `json:"server_url"`
-	AgentID          string `json:"agent_id"`
-	APIKey           string `json:"api_key"`
-	CACertPath       string `json:"ca_cert_path,omitempty"`
-	HardwareUUID     string `json:"hardware_uuid"`
-	SigningPublicKey string `json:"signing_public_key,omitempty"`
+	ServerURL            string `json:"server_url"`
+	AgentID              string `json:"agent_id"`
+	APIKey               string `json:"api_key"`
+	CACertPath           string `json:"ca_cert_path,omitempty"`
+	ClientCertPath       string `json:"client_cert_path,omitempty"`
+	ClientKeyPath        string `json:"client_key_path,omitempty"`
+	ServerCertPinSHA256  string `json:"server_cert_pin_sha256,omitempty"`
+	HardwareUUID         string `json:"hardware_uuid"`
+	SigningPublicKey     string `json:"signing_public_key,omitempty"`
+	SigningKeyFingerprint string `json:"signing_key_fingerprint,omitempty"`
 }
 
 // utf8BOM represents the 3-byte sequence added by Windows PowerShell/Notepad.

@@ -1,4 +1,6 @@
 import re
+import secrets
+import time
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
@@ -16,6 +18,7 @@ from app.core.crypto import (
 from app.core.rbac import (
     Permission,
     Principal,
+    Role,
     ensure_agent_access,
     require_permissions,
 )
@@ -36,6 +39,31 @@ from app.schemas.task import TaskDispatchFrame
 router = APIRouter()
 
 PLACEHOLDER_PATTERN = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+DANGEROUS_PARAM_CHARS = re.compile(r"[\x00\r\n;&|`]|(?:\$\()|[\"']")
+
+
+def _ensure_script_read_access(principal: Principal, script: Script) -> None:
+    """Enforces multi-tenant isolation when reading or executing a keystore script."""
+    if principal.role == Role.SUPER_ADMIN and principal.org_id is None:
+        return
+    if principal.org_id is not None:
+        if script.is_system_global or script.org_id == principal.org_id:
+            return
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: script belongs to another tenant organization.",
+        )
+
+
+def _ensure_script_write_access(principal: Principal, script: Script) -> None:
+    """Enforces multi-tenant isolation when modifying or deleting a keystore script."""
+    if principal.role == Role.SUPER_ADMIN and principal.org_id is None:
+        return
+    if principal.org_id is not None and script.org_id != principal.org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: cannot modify or delete another organization's or system-global script.",
+        )
 
 
 def _merge_extracted_parameters(
@@ -100,6 +128,14 @@ def _render_script_content(
             resolved[name] = ""
 
     for key, val in runtime_values.items():
+        if val is not None and DANGEROUS_PARAM_CHARS.search(str(val)):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"Prohibited shell metacharacters detected in parameter '{key}'. "
+                    "Values must not contain command chaining, newlines, quotes, or subshell directives."
+                ),
+            )
         if key not in resolved and val is not None:
             resolved[key] = str(val)
 
@@ -129,13 +165,31 @@ def _render_script_content(
 )
 async def create_script(
     payload: ScriptCreate,
-    _principal: Principal = Depends(require_permissions(Permission.SCRIPT_WRITE)),
+    principal: Principal = Depends(require_permissions(Permission.SCRIPT_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Stores a tagged, parameterized script in the PostgreSQL Script Keystore."""
+    """Stores a tagged, parameterized script in the PostgreSQL Script Keystore with tenant scoping."""
     merged_params = _merge_extracted_parameters(payload.content, payload.parameters)
 
+    if principal.org_id is not None:
+        if payload.org_id is not None and payload.org_id != principal.org_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: cannot create a script for another tenant organization.",
+            )
+        effective_org_id = principal.org_id
+        effective_global = False
+    else:
+        effective_org_id = payload.org_id
+        effective_global = (
+            payload.is_system_global
+            if payload.is_system_global is not None
+            else (effective_org_id is None)
+        )
+
     script = Script(
+        org_id=effective_org_id,
+        is_system_global=effective_global,
         name=payload.name.strip(),
         description=payload.description,
         shell_type=payload.shell_type,
@@ -179,11 +233,19 @@ async def list_scripts(
     ),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
-    _principal: Principal = Depends(require_permissions(Permission.SCRIPT_READ)),
+    principal: Principal = Depends(require_permissions(Permission.SCRIPT_READ)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Retrieves stored scripts ordered alphabetically by name."""
+    """Retrieves stored scripts ordered alphabetically by name within the caller's tenant scope."""
     stmt = select(Script)
+
+    if principal.role != Role.SUPER_ADMIN and principal.org_id is not None:
+        stmt = stmt.where(
+            or_(
+                Script.org_id == principal.org_id,
+                Script.is_system_global.is_(True),
+            )
+        )
 
     if tag and tag.strip():
         normalized_tag = tag.strip().lower()
@@ -214,7 +276,7 @@ async def list_scripts(
 )
 async def get_script(
     script_id: UUID,
-    _principal: Principal = Depends(require_permissions(Permission.SCRIPT_READ)),
+    principal: Principal = Depends(require_permissions(Permission.SCRIPT_READ)),
     db: AsyncSession = Depends(get_db),
 ):
     """Retrieves full script content, tags, and parameter metadata by ID."""
@@ -225,6 +287,7 @@ async def get_script(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Script not found.",
         )
+    _ensure_script_read_access(principal, script)
     return script
 
 
@@ -243,7 +306,7 @@ async def get_script(
 async def update_script(
     script_id: UUID,
     payload: ScriptUpdate,
-    _principal: Principal = Depends(require_permissions(Permission.SCRIPT_WRITE)),
+    principal: Principal = Depends(require_permissions(Permission.SCRIPT_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
     """Updates script fields, normalizes tags, and refreshes template parameter definitions."""
@@ -254,6 +317,7 @@ async def update_script(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Script not found.",
         )
+    _ensure_script_write_access(principal, script)
 
     update_data = payload.model_dump(exclude_unset=True)
 
@@ -269,6 +333,12 @@ async def update_script(
         script.tags = update_data["tags"]
     if "timeout_sec" in update_data and update_data["timeout_sec"] is not None:
         script.timeout_sec = update_data["timeout_sec"]
+    if (
+        "is_system_global" in update_data
+        and update_data["is_system_global"] is not None
+        and principal.org_id is None
+    ):
+        script.is_system_global = update_data["is_system_global"]
 
     if "parameters" in update_data and update_data["parameters"] is not None:
         declared_params = [
@@ -300,7 +370,7 @@ async def update_script(
 )
 async def delete_script(
     script_id: UUID,
-    _principal: Principal = Depends(require_permissions(Permission.SCRIPT_WRITE)),
+    principal: Principal = Depends(require_permissions(Permission.SCRIPT_WRITE)),
     db: AsyncSession = Depends(get_db),
 ):
     """Permanently removes a script from the keystore."""
@@ -311,6 +381,7 @@ async def delete_script(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Script not found.",
         )
+    _ensure_script_write_access(principal, script)
 
     await db.delete(script)
     await db.commit()
@@ -345,6 +416,7 @@ async def render_script(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Script not found.",
         )
+    _ensure_script_read_access(principal, script)
 
     rendered_command = _render_script_content(
         content=script.content,
@@ -370,19 +442,34 @@ async def render_script(
         )
 
         task_id = uuid4()
+        issued_at = int(time.time())
+        expires_at = issued_at + max(300, script.timeout_sec + 60)
+        nonce = secrets.token_hex(16)
         request.state.audit_task_id = task_id
         payload_sha256 = compute_task_digest(
             task_id=task_id,
             command=rendered_command,
             timeout_sec=script.timeout_sec,
+            agent_id=payload.agent_id,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            nonce=nonce,
         )
         signature = sign_task_dispatch(
             task_id=task_id,
             command=rendered_command,
             timeout_sec=script.timeout_sec,
+            agent_id=payload.agent_id,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            nonce=nonce,
         )
         task_frame = TaskDispatchFrame(
             task_id=task_id,
+            agent_id=payload.agent_id,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            nonce=nonce,
             command=rendered_command,
             timeout_sec=script.timeout_sec,
             payload_sha256=payload_sha256,
@@ -413,7 +500,7 @@ async def render_script(
     return ScriptRenderResponse(
         script_id=script.id,
         name=script.name,
-        shell_type=script.shell_type,  # type: ignore[arg-type]
+        shell_type=script.shell_type,
         rendered_command=rendered_command,
         timeout_sec=script.timeout_sec,
         payload_sha256=payload_sha256,

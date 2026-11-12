@@ -8,16 +8,22 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
 // maxStreamCaptureBytes limits individual stdout/stderr captures to 2MB
 const maxStreamCaptureBytes int64 = 2 * 1024 * 1024
+
+// cmdDirectiveRegex matches explicit CMD invocations (e.g. "cmd /c ...", "cmd.exe /C ...", "CMD  /k ...")
+// regardless of .exe extension, casing, or intermediate whitespace.
+var cmdDirectiveRegex = regexp.MustCompile(`(?is)^\s*cmd(?:\.exe)?\s+(/[ck])\s+(.*)$`)
 
 // WindowsExecutor implements CommandExecutor for Windows environments.
 type WindowsExecutor struct{}
@@ -29,10 +35,10 @@ func NewExecutor() CommandExecutor {
 
 // buildCommand prepares the execution command using powershell.exe or cmd.exe
 func buildCommand(command string) *exec.Cmd {
-	// If explicitly prefixed with cmd.exe, route via CMD, otherwise default to PowerShell
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(command)), "cmd /c ") {
-		rawCmd := strings.TrimSpace(command)[7:]
-		return exec.Command("cmd.exe", "/c", rawCmd)
+	if matches := cmdDirectiveRegex.FindStringSubmatch(command); len(matches) == 3 {
+		switchFlag := strings.ToLower(matches[1])
+		rawCmd := strings.TrimSpace(matches[2])
+		return exec.Command("cmd.exe", switchFlag, rawCmd)
 	}
 
 	// Hardened PowerShell parameters: isolated profile, non-interactive, execution policy bypass
@@ -44,13 +50,83 @@ func buildCommand(command string) *exec.Cmd {
 	)
 }
 
-// killProcessTreeWin terminates the target process and all child descendants recursively.
+// terminateProcessTreeWin32 walks the Windows process table via CreateToolhelp32Snapshot
+// and terminates all descendant child processes (bottom-up) followed by the root PID using
+// native Win32 OpenProcess + TerminateProcess calls so process termination succeeds even
+// when taskkill.exe is blocked by AppLocker/WDAC or missing from PATH.
+func terminateProcessTreeWin32(rootPID uint32) error {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(snapshot)
+
+	childrenMap := make(map[uint32][]uint32)
+	var pe windows.ProcessEntry32
+	pe.Size = uint32(unsafe.Sizeof(pe))
+
+	if err := windows.Process32First(snapshot, &pe); err == nil {
+		for {
+			if pe.ProcessID != 0 && pe.ProcessID != pe.ParentProcessID {
+				childrenMap[pe.ParentProcessID] = append(childrenMap[pe.ParentProcessID], pe.ProcessID)
+			}
+			if err := windows.Process32Next(snapshot, &pe); err != nil {
+				break
+			}
+		}
+	}
+
+	visited := make(map[uint32]bool)
+	var orderedPIDs []uint32
+	var collectDescendants func(pid uint32)
+	collectDescendants = func(pid uint32) {
+		if visited[pid] {
+			return
+		}
+		visited[pid] = true
+		for _, childPID := range childrenMap[pid] {
+			collectDescendants(childPID)
+		}
+		orderedPIDs = append(orderedPIDs, pid)
+	}
+	collectDescendants(rootPID)
+
+	var firstErr error
+	for _, targetPID := range orderedPIDs {
+		procHandle, openErr := windows.OpenProcess(windows.PROCESS_TERMINATE, false, targetPID)
+		if openErr != nil {
+			if targetPID == rootPID && firstErr == nil {
+				firstErr = openErr
+			}
+			continue
+		}
+		if termErr := windows.TerminateProcess(procHandle, 1); termErr != nil && targetPID == rootPID && firstErr == nil {
+			firstErr = termErr
+		}
+		_ = windows.CloseHandle(procHandle)
+	}
+
+	return firstErr
+}
+
+// killProcessTreeWin terminates the target process and all child descendants recursively
+// using native Win32 APIs first, with taskkill.exe as a secondary fallback.
 func killProcessTreeWin(pid int) error {
+	if pid <= 0 {
+		return nil
+	}
+
+	win32Err := terminateProcessTreeWin32(uint32(pid))
+
 	killCmd := exec.Command("taskkill.exe", "/F", "/T", "/PID", strconv.Itoa(pid))
 	killCmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: windows.CREATE_NO_WINDOW,
 	}
-	return killCmd.Run()
+	if taskkillErr := killCmd.Run(); taskkillErr == nil {
+		return nil
+	}
+
+	return win32Err
 }
 
 // Execute runs a PowerShell script or CMD directive enforcing recursive tree termination on timeout.
@@ -88,7 +164,7 @@ func (e *WindowsExecutor) Execute(ctx context.Context, command string) (CommandR
 	go func() {
 		select {
 		case <-ctx.Done():
-			// Execute recursive tree termination via taskkill to prevent orphaned processes
+			// Execute recursive tree termination via Win32 API + taskkill fallback
 			if cmd.Process != nil {
 				_ = killProcessTreeWin(cmd.Process.Pid)
 			}

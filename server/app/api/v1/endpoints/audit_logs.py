@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.rbac import Permission, Principal, require_permissions
+from app.core.rbac import Permission, Principal, Role, require_permissions
 from app.db.session import get_db
 from app.models.audit_log import AuditLog
 from app.schemas.audit_log import AuditLogRead
@@ -17,12 +17,20 @@ router = APIRouter()
     "",
     response_model=List[AuditLogRead],
     status_code=status.HTTP_200_OK,
-    summary="List immutable security audit logs with optional filtering",
+    summary="List immutable security audit logs with multi-tenant isolation and optional filtering",
 )
 async def list_audit_logs(
     admin_id: Optional[UUID] = Query(
         default=None,
         description="Filter by executing operator/admin UUID",
+    ),
+    org_id: Optional[UUID] = Query(
+        default=None,
+        description="Filter by tenant organization UUID",
+    ),
+    site_id: Optional[UUID] = Query(
+        default=None,
+        description="Filter by site UUID",
     ),
     target_agent_id: Optional[UUID] = Query(
         default=None,
@@ -42,14 +50,37 @@ async def list_audit_logs(
     ),
     limit: int = Query(default=100, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
-    _principal: Principal = Depends(require_permissions(Permission.AUDIT_READ)),
+    principal: Principal = Depends(require_permissions(Permission.AUDIT_READ)),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Retrieves immutable security audit logs ordered from newest to oldest.
-    Restricted to roles holding `audit:read` (SuperAdmin and Auditor).
+    Restricted to roles holding `audit:read` (SuperAdmin and Auditor) and strictly
+    scoped to the caller's organization/site boundaries when tenant-bound.
     """
     stmt = select(AuditLog).order_by(AuditLog.created_at.desc())
+
+    # Enforce strict multi-tenant isolation for organization/site-scoped principals
+    if principal.role != Role.SUPER_ADMIN:
+        if principal.site_id is not None:
+            if site_id is not None and site_id != principal.site_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access denied: requested site_id is outside caller's tenant boundary.",
+                )
+            stmt = stmt.where(AuditLog.site_id == principal.site_id)
+        elif principal.org_id is not None:
+            if org_id is not None and org_id != principal.org_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Access denied: requested org_id is outside caller's tenant boundary.",
+                )
+            stmt = stmt.where(AuditLog.org_id == principal.org_id)
+
+    if org_id is not None:
+        stmt = stmt.where(AuditLog.org_id == org_id)
+    if site_id is not None:
+        stmt = stmt.where(AuditLog.site_id == site_id)
 
     resolved_agent_filter = target_agent_id or agent_id
     if admin_id is not None:
@@ -81,10 +112,10 @@ async def list_audit_logs(
 )
 async def get_audit_log(
     log_id: UUID,
-    _principal: Principal = Depends(require_permissions(Permission.AUDIT_READ)),
+    principal: Principal = Depends(require_permissions(Permission.AUDIT_READ)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Retrieves a specific immutable audit log record by ID."""
+    """Retrieves a specific immutable audit log record by ID within the caller's tenant boundary."""
     stmt = select(AuditLog).where(AuditLog.id == log_id)
     entry = (await db.execute(stmt)).scalar_one_or_none()
     if not entry:
@@ -92,6 +123,19 @@ async def get_audit_log(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Audit log entry not found.",
         )
+
+    if principal.role != Role.SUPER_ADMIN:
+        if principal.site_id is not None and entry.site_id != principal.site_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: audit log belongs to another site.",
+            )
+        if principal.org_id is not None and entry.org_id != principal.org_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: audit log belongs to another organization.",
+            )
+
     return entry
 
 

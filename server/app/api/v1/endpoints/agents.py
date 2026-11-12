@@ -1,8 +1,10 @@
 from datetime import datetime, timezone
+import secrets
+import time
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -133,17 +135,35 @@ async def get_agent_telemetry(
 async def dispatch_agent_task(
     request: Request,
     agent_id: UUID,
-    command: str,
-    timeout_sec: int = 30,
+    command: Optional[str] = Query(default=None),
+    timeout_sec: int = Query(default=30),
+    payload: Optional[Dict[str, Any]] = Body(default=None),
     principal: Principal = Depends(require_permissions(Permission.AGENT_DISPATCH)),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Routes a signed TaskDispatchFrame over the active agent WebSocket tunnel.
+    Supports command payload in JSON request body (recommended) or query parameter fallback.
     Requires `agents:dispatch` permission (SuperAdmin or SiteTechnician) and site access.
     """
+    effective_cmd = ""
+    effective_timeout = timeout_sec
+    if payload and isinstance(payload, dict):
+        if "command" in payload and payload["command"]:
+            effective_cmd = str(payload["command"]).strip()
+        if "timeout_sec" in payload and payload["timeout_sec"] is not None:
+            effective_timeout = int(payload["timeout_sec"])
+    if not effective_cmd and command:
+        effective_cmd = command.strip()
+
+    if not effective_cmd:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Field 'command' is required in request body or query parameter.",
+        )
+
     request.state.audit_target_agent_id = agent_id
-    request.state.audit_command_text = command
+    request.state.audit_command_text = effective_cmd
 
     await ensure_agent_access(
         principal,
@@ -153,28 +173,43 @@ async def dispatch_agent_task(
     )
 
     task_id = uuid4()
+    issued_at = int(time.time())
+    expires_at = issued_at + max(300, effective_timeout + 60)
+    nonce = secrets.token_hex(16)
     request.state.audit_task_id = task_id
     payload_sha256 = compute_task_digest(
         task_id=task_id,
-        command=command,
-        timeout_sec=timeout_sec,
+        command=effective_cmd,
+        timeout_sec=effective_timeout,
+        agent_id=agent_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        nonce=nonce,
     )
     signature = sign_task_dispatch(
         task_id=task_id,
-        command=command,
-        timeout_sec=timeout_sec,
+        command=effective_cmd,
+        timeout_sec=effective_timeout,
+        agent_id=agent_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        nonce=nonce,
     )
     task_frame = TaskDispatchFrame(
         task_id=task_id,
-        command=command,
-        timeout_sec=timeout_sec,
+        agent_id=agent_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        nonce=nonce,
+        command=effective_cmd,
+        timeout_sec=effective_timeout,
         payload_sha256=payload_sha256,
         signature=signature,
     )
     ws_manager.register_dispatched_task(
         task_id=task_id,
         agent_id=agent_id,
-        command_text=command,
+        command_text=effective_cmd,
         principal=principal,
     )
     routed = await ws_manager.route_to_agent(

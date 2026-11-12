@@ -8,11 +8,13 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"tactical-rmm/agent/internal/authmon"
 	"tactical-rmm/agent/internal/client"
 	"tactical-rmm/agent/internal/config"
+	agentCrypto "tactical-rmm/agent/internal/crypto"
 	"tactical-rmm/agent/internal/eventlog"
 	"tactical-rmm/agent/internal/fim"
 	"tactical-rmm/agent/internal/inventory"
@@ -29,12 +31,27 @@ const (
 	serviceDescription = "Tactical RMM Endpoint Management Agent"
 )
 
+// Compile-time cryptographic root of trust injectable via -ldflags:
+// -ldflags "-X main.DefaultSigningPublicKey=... -X main.DefaultSigningFingerprint=..."
+var (
+	DefaultSigningPublicKey   = ""
+	DefaultSigningFingerprint = ""
+)
+
 // HeartbeatBeaconFrame models the lightweight keep-alive payload dispatched upstream.
 type HeartbeatBeaconFrame struct {
 	Type      string                   `json:"type"`
 	AgentID   string                   `json:"agent_id"`
 	Timestamp int64                    `json:"timestamp"`
 	Telemetry system.TelemetrySnapshot `json:"telemetry"`
+}
+
+type cliSecurityOptions struct {
+	SigningPubKey      string
+	SigningFingerprint string
+	CertPinSHA256      string
+	ClientCertPath     string
+	ClientKeyPath      string
 }
 
 func main() {
@@ -45,6 +62,7 @@ func main() {
 		configPath    string
 		serviceAction string
 		enrollOnly    bool
+		secOpts       cliSecurityOptions
 	)
 
 	flag.StringVar(&serverURL, "server", "", "FastAPI Control Plane URL (e.g. https://c2.example.com)")
@@ -53,10 +71,24 @@ func main() {
 	flag.StringVar(&configPath, "config", "", "Optional path to local agent configuration file")
 	flag.StringVar(&serviceAction, "service", "", "Service management action: [install | start | stop | uninstall]")
 	flag.BoolVar(&enrollOnly, "enroll-only", false, "Perform identity bootstrap enrollment and exit immediately")
+	flag.StringVar(&secOpts.SigningPubKey, "signing-pubkey", DefaultSigningPublicKey, "Pinned Base64 or PEM Ed25519 verification public key")
+	flag.StringVar(&secOpts.SigningFingerprint, "signing-pubkey-fingerprint", DefaultSigningFingerprint, "Pinned SHA-256 hex fingerprint of the server Ed25519 public key")
+	flag.StringVar(&secOpts.CertPinSHA256, "cert-pin-sha256", "", "Pinned SHA-256 hex digest of the server TLS certificate or SPKI")
+	flag.StringVar(&secOpts.ClientCertPath, "client-cert", "", "Optional path to mTLS client certificate PEM")
+	flag.StringVar(&secOpts.ClientKeyPath, "client-key", "", "Optional path to mTLS client private key PEM")
 	flag.Parse()
 
 	if token == "" {
 		token = strings.TrimSpace(os.Getenv("RMM_ENROLL_TOKEN"))
+	}
+	if secOpts.SigningPubKey == "" {
+		secOpts.SigningPubKey = strings.TrimSpace(os.Getenv("RMM_SIGNING_PUBKEY"))
+	}
+	if secOpts.SigningFingerprint == "" {
+		secOpts.SigningFingerprint = strings.TrimSpace(os.Getenv("RMM_SIGNING_PUBKEY_FINGERPRINT"))
+	}
+	if secOpts.CertPinSHA256 == "" {
+		secOpts.CertPinSHA256 = strings.TrimSpace(os.Getenv("RMM_CERT_PIN_SHA256"))
 	}
 
 	// 1. Independent bootstrap enrollment mode
@@ -64,7 +96,7 @@ func main() {
 		if serverURL == "" || token == "" {
 			log.Fatalf("[-] Enrollment requires both -server and -token (or RMM_ENROLL_TOKEN)")
 		}
-		if err := bootstrapEnrollment(serverURL, token, caCertPath, configPath); err != nil {
+		if err := bootstrapEnrollment(serverURL, token, caCertPath, configPath, secOpts); err != nil {
 			log.Fatalf("[-] Enrollment failure: %v", err)
 		}
 		log.Println("[+] Enrollment bootstrap completed successfully.")
@@ -81,7 +113,7 @@ func main() {
 	// 3. Daemon execution mode under OS service supervision
 	ctx := context.Background()
 	err := svcMgr.Run(ctx, func(serviceCtx context.Context) error {
-		return runAgent(serviceCtx, serverURL, token, caCertPath, configPath)
+		return runAgent(serviceCtx, serverURL, token, caCertPath, configPath, secOpts)
 	})
 
 	if err != nil {
@@ -118,7 +150,7 @@ func handleServiceAction(mgr service.Manager, action string) {
 	}
 }
 
-func bootstrapEnrollment(serverURL, token, caCertPath, configPath string) error {
+func bootstrapEnrollment(serverURL, token, caCertPath, configPath string, secOpts cliSecurityOptions) error {
 	resolvedPath := config.ResolveConfigPath(configPath)
 
 	hostInfo, err := system.CollectHostInfo()
@@ -132,19 +164,45 @@ func bootstrapEnrollment(serverURL, token, caCertPath, configPath string) error 
 	if err != nil {
 		return fmt.Errorf("failed to initialize enrollment client: %w", err)
 	}
+	if err := enrollClient.ConfigureTLS(secOpts.ClientCertPath, secOpts.ClientKeyPath, secOpts.CertPinSHA256); err != nil {
+		return fmt.Errorf("failed to configure enrollment TLS security controls: %w", err)
+	}
 
 	enrollResp, err := enrollClient.EnrollEndpoint(token, hostInfo)
 	if err != nil {
 		return fmt.Errorf("enrollment failed: %w", err)
 	}
 
+	effectivePubKey := strings.TrimSpace(secOpts.SigningPubKey)
+	if effectivePubKey == "" {
+		effectivePubKey = strings.TrimSpace(enrollResp.SigningPublicKey)
+	}
+
+	var computedFingerprint string
+	if effectivePubKey != "" {
+		parsedKey, parseErr := agentCrypto.ParseEd25519PublicKey(effectivePubKey)
+		if parseErr != nil {
+			return fmt.Errorf("invalid Ed25519 public key received during enrollment: %w", parseErr)
+		}
+		computedFingerprint = agentCrypto.ComputePublicKeyFingerprint(parsedKey)
+		if strings.TrimSpace(secOpts.SigningFingerprint) != "" {
+			if fpErr := agentCrypto.VerifyPublicKeyFingerprint(effectivePubKey, secOpts.SigningFingerprint); fpErr != nil {
+				return fmt.Errorf("enrollment aborted due to Ed25519 public key pin violation: %w", fpErr)
+			}
+		}
+	}
+
 	agentCfg := &config.AgentConfig{
-		ServerURL:        serverURL,
-		AgentID:          enrollResp.ID,
-		APIKey:           enrollResp.APIKey,
-		CACertPath:       caCertPath,
-		HardwareUUID:     hostInfo.HardwareUUID,
-		SigningPublicKey: enrollResp.SigningPublicKey,
+		ServerURL:            serverURL,
+		AgentID:              enrollResp.ID,
+		APIKey:               enrollResp.APIKey,
+		CACertPath:           caCertPath,
+		ClientCertPath:       secOpts.ClientCertPath,
+		ClientKeyPath:        secOpts.ClientKeyPath,
+		ServerCertPinSHA256:  secOpts.CertPinSHA256,
+		HardwareUUID:         hostInfo.HardwareUUID,
+		SigningPublicKey:     effectivePubKey,
+		SigningKeyFingerprint: computedFingerprint,
 	}
 
 	if err := config.SaveConfig(agentCfg, resolvedPath); err != nil {
@@ -154,7 +212,7 @@ func bootstrapEnrollment(serverURL, token, caCertPath, configPath string) error 
 	return nil
 }
 
-func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath string) error {
+func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath string, secOpts cliSecurityOptions) error {
 	resolvedConfigPath := config.ResolveConfigPath(configPath)
 
 	agentCfg, err := config.LoadConfig(resolvedConfigPath)
@@ -169,22 +227,62 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 		effectiveCACert = caCertPath
 	}
 
+	effectiveClientCert := agentCfg.ClientCertPath
+	if secOpts.ClientCertPath != "" {
+		effectiveClientCert = secOpts.ClientCertPath
+	}
+	effectiveClientKey := agentCfg.ClientKeyPath
+	if secOpts.ClientKeyPath != "" {
+		effectiveClientKey = secOpts.ClientKeyPath
+	}
+	effectiveCertPin := agentCfg.ServerCertPinSHA256
+	if secOpts.CertPinSHA256 != "" {
+		effectiveCertPin = secOpts.CertPinSHA256
+	}
+
+	if strings.TrimSpace(agentCfg.SigningPublicKey) == "" && strings.TrimSpace(secOpts.SigningPubKey) != "" {
+		agentCfg.SigningPublicKey = strings.TrimSpace(secOpts.SigningPubKey)
+	}
+
+	expectedFingerprint := strings.TrimSpace(secOpts.SigningFingerprint)
+	if expectedFingerprint == "" {
+		expectedFingerprint = strings.TrimSpace(agentCfg.SigningKeyFingerprint)
+	}
+
+	// Eliminate unauthenticated TOFU: only synchronize public key over network if an explicit
+	// SHA-256 fingerprint pin is configured and verified in constant time.
 	if strings.TrimSpace(agentCfg.SigningPublicKey) == "" {
-		if enrollClient, err := client.NewEnrollmentClient(agentCfg.ServerURL, effectiveCACert, 10*time.Second); err == nil {
-			if pubResp, fetchErr := enrollClient.FetchServerPublicKey(); fetchErr == nil && pubResp.PublicKeyB64 != "" {
-				agentCfg.SigningPublicKey = pubResp.PublicKeyB64
-				_ = config.SaveConfig(agentCfg, resolvedConfigPath)
-				log.Printf("[+] [Security] Synchronized Ed25519 verification public key (SHA256: %s)", pubResp.FingerprintSHA256)
+		if expectedFingerprint == "" {
+			log.Println("[!] [Security] No pinned Ed25519 verification key or SHA-256 fingerprint configured; refusing unverified TOFU key fetch.")
+		} else if enrollClient, err := client.NewEnrollmentClient(agentCfg.ServerURL, effectiveCACert, 10*time.Second); err == nil {
+			if tlsErr := enrollClient.ConfigureTLS(effectiveClientCert, effectiveClientKey, effectiveCertPin); tlsErr != nil {
+				return fmt.Errorf("failed to configure TLS for key synchronization: %w", tlsErr)
 			}
+			if pubResp, fetchErr := enrollClient.FetchServerPublicKey(); fetchErr == nil && pubResp.PublicKeyB64 != "" {
+				if fpErr := agentCrypto.VerifyPublicKeyFingerprint(pubResp.PublicKeyB64, expectedFingerprint); fpErr != nil {
+					return fmt.Errorf("rejected server Ed25519 public key due to fingerprint mismatch: %w", fpErr)
+				}
+				agentCfg.SigningPublicKey = pubResp.PublicKeyB64
+				agentCfg.SigningKeyFingerprint = expectedFingerprint
+				_ = config.SaveConfig(agentCfg, resolvedConfigPath)
+				log.Printf("[+] [Security] Verified and synchronized Ed25519 public key against pinned fingerprint (SHA256: %s)", expectedFingerprint)
+			}
+		}
+	} else if expectedFingerprint != "" {
+		if fpErr := agentCrypto.VerifyPublicKeyFingerprint(agentCfg.SigningPublicKey, expectedFingerprint); fpErr != nil {
+			return fmt.Errorf("stored Ed25519 public key does not match pinned SHA-256 fingerprint: %w", fpErr)
 		}
 	}
 
 	wsConfig := ws.Config{
-		ServerURL:        agentCfg.ServerURL,
-		AgentID:          agentCfg.AgentID,
-		APIKey:           agentCfg.APIKey,
-		CACertPath:       effectiveCACert,
-		SigningPublicKey: agentCfg.SigningPublicKey,
+		ServerURL:           agentCfg.ServerURL,
+		AgentID:             agentCfg.AgentID,
+		APIKey:              agentCfg.APIKey,
+		CACertPath:          effectiveCACert,
+		ClientCertPath:      effectiveClientCert,
+		ClientKeyPath:       effectiveClientKey,
+		ServerCertPinSHA256: effectiveCertPin,
+		SigningPublicKey:    agentCfg.SigningPublicKey,
 	}
 
 	wsClient, err := ws.NewClient(wsConfig)
@@ -192,20 +290,50 @@ func runAgent(ctx context.Context, serverURL, token, caCertPath, configPath stri
 		return fmt.Errorf("failed to initialize WebSocket client: %w", err)
 	}
 
-	// 1. Launch WebSocket tunnel supervisor asynchronously
-	go wsClient.Run(ctx)
+	var wg sync.WaitGroup
 
-	// 2. Launch Background Collector Loops
-	go runHardwareTelemetryLoop(ctx, agentCfg, wsClient)
-	go runNetworkTelemetryLoop(ctx, agentCfg, wsClient)
-	go runProcessTelemetryLoop(ctx, agentCfg, wsClient)
-	go runSecurityEventLoop(ctx, agentCfg, wsClient)
-	go runAuthMonitorLoop(ctx, agentCfg, wsClient)
-	go runFIMLoop(ctx, agentCfg, wsClient)
-	go runSoftwareInventoryLoop(ctx, agentCfg, wsClient)
+	// 1. Launch WebSocket tunnel supervisor asynchronously and track lifecycle
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		wsClient.Run(ctx)
+	}()
+
+	// 2. Launch Background Collector Loops and track lifecycle
+	loops := []func(context.Context, *config.AgentConfig, *ws.Client){
+		runHardwareTelemetryLoop,
+		runNetworkTelemetryLoop,
+		runProcessTelemetryLoop,
+		runSecurityEventLoop,
+		runAuthMonitorLoop,
+		runFIMLoop,
+		runSoftwareInventoryLoop,
+	}
+	for _, loopFn := range loops {
+		fn := loopFn
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fn(ctx, agentCfg, wsClient)
+		}()
+	}
 
 	// 3. Run Heartbeat Loop (every 30 seconds) and block until cancellation
 	runHeartbeatLoop(ctx, agentCfg, wsClient)
+
+	// 4. Await graceful teardown of WebSocket RFC-6455 close handshake and collector loops
+	doneCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
+
+	select {
+	case <-doneCh:
+		log.Println("[+] [Lifecycle] All collector loops and WebSocket tunnel terminated cleanly.")
+	case <-time.After(5 * time.Second):
+		log.Println("[!] [Lifecycle] Graceful teardown deadline elapsed; proceeding with exit.")
+	}
 
 	return nil
 }
@@ -238,7 +366,7 @@ func runHeartbeatLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws
 				continue
 			}
 
-			if queued := wsClient.Send(payload); queued {
+			if queued := wsClient.SendPriority(payload); queued {
 				log.Printf("[+] [Heartbeat] Lightweight beacon queued (Agent Heap: %dMB, Goroutines: %d, Uptime: %ds)",
 					telemetrySnapshot.MemoryAllocMB, telemetrySnapshot.NumGoroutine, telemetrySnapshot.UptimeSeconds)
 			} else {
@@ -251,6 +379,20 @@ func runHeartbeatLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws
 func runHardwareTelemetryLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Client) {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
+
+	// Dispatch initial hardware telemetry shortly after startup so the dashboard has real CPU/RAM metrics immediately
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(1500 * time.Millisecond):
+			if frame, err := telemetry.CollectHardwareTelemetry(cfg.AgentID); err == nil {
+				if payload, err := json.Marshal(frame); err == nil {
+					wsClient.Send(payload)
+				}
+			}
+		}
+	}()
 
 	for {
 		select {
@@ -402,7 +544,7 @@ func dispatchSecurityEvents(agentID string, watcher *eventlog.Watcher, wsClient 
 		return
 	}
 
-	if queued := wsClient.Send(payload); queued {
+	if queued := wsClient.SendPriority(payload); queued {
 		log.Printf("[+] [SecurityEvent] Critical security events dispatched (%d events, Payload: %d bytes)", len(events), len(payload))
 	} else {
 		log.Printf("[-] [SecurityEvent] Outbound buffer saturated; dropped event frame for Agent [%s]", agentID)
@@ -437,7 +579,7 @@ func runAuthMonitorLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *
 				continue
 			}
 
-			if queued := wsClient.Send(payload); queued {
+			if queued := wsClient.SendPriority(payload); queued {
 				log.Printf("[+] [AuthMon] Forensic events dispatched (%d events, Payload: %d bytes)", len(events), len(payload))
 			} else {
 				log.Printf("[-] [AuthMon] Outbound buffer saturated; dropped frame for Agent [%s]", cfg.AgentID)
@@ -472,7 +614,7 @@ func runFIMLoop(ctx context.Context, cfg *config.AgentConfig, wsClient *ws.Clien
 				continue
 			}
 
-			if queued := wsClient.Send(payload); queued {
+			if queued := wsClient.SendPriority(payload); queued {
 				log.Printf("[!] [FIM] Cryptographic drift alerts dispatched (%d alerts, Payload: %d bytes)", len(alerts), len(payload))
 			} else {
 				log.Printf("[-] [FIM] Outbound buffer saturated; dropped frame for Agent [%s]", cfg.AgentID)

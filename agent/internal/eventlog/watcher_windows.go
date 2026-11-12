@@ -5,6 +5,7 @@ package eventlog
 import (
 	"encoding/xml"
 	"fmt"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -48,30 +49,60 @@ type xmlEvent struct {
 	} `xml:"EventData"`
 }
 
-// Watcher manages native Windows Event Log queries.
-type Watcher struct{}
-
-// NewWatcher initializes a new Windows Event Log watcher.
-func NewWatcher() *Watcher {
-	return &Watcher{}
+// Watcher manages native Windows Event Log queries with deduplication.
+type Watcher struct {
+	mu        sync.Mutex
+	seenEvents map[string]struct{}
 }
 
-// ReadSecurityEvents queries critical Security (4624, 4625) and System (7045) events.
+// NewWatcher initializes a new Windows Event Log watcher with deduplication cache.
+func NewWatcher() *Watcher {
+	return &Watcher{
+		seenEvents: make(map[string]struct{}),
+	}
+}
+
+// ReadSecurityEvents queries critical Security (4624, 4625) and System (7045) events,
+// filtering out previously ingested records to prevent continuous event replay.
 func (w *Watcher) ReadSecurityEvents(maxEvents uint32) ([]SecurityEvent, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	var collected []SecurityEvent
 
 	// 1. Query Security Channel: Logon (4624) and Failed Logon (4625)
 	secQuery := "*[System[(EventID=4624 or EventID=4625)]]"
 	secEvents, err := queryChannelEvents("Security", secQuery, maxEvents)
 	if err == nil {
-		collected = append(collected, secEvents...)
+		for _, ev := range secEvents {
+			key := fmt.Sprintf("%s:%d:%s:%s", ev.Channel, ev.EventID, ev.TimeCreated, ev.TargetUserName)
+			if _, seen := w.seenEvents[key]; !seen {
+				w.seenEvents[key] = struct{}{}
+				collected = append(collected, ev)
+			}
+		}
 	}
 
 	// 2. Query System Channel: Service Creation (7045)
 	sysQuery := "*[System[(EventID=7045)]]"
 	sysEvents, err := queryChannelEvents("System", sysQuery, maxEvents)
 	if err == nil {
-		collected = append(collected, sysEvents...)
+		for _, ev := range sysEvents {
+			key := fmt.Sprintf("%s:%d:%s:%s", ev.Channel, ev.EventID, ev.TimeCreated, ev.ServiceName)
+			if _, seen := w.seenEvents[key]; !seen {
+				w.seenEvents[key] = struct{}{}
+				collected = append(collected, ev)
+			}
+		}
+	}
+
+	// Bound deduplication cache to prevent memory creep
+	if len(w.seenEvents) > 10000 {
+		w.seenEvents = make(map[string]struct{})
+		for _, ev := range collected {
+			key := fmt.Sprintf("%s:%d:%s:%s", ev.Channel, ev.EventID, ev.TimeCreated, ev.TargetUserName)
+			w.seenEvents[key] = struct{}{}
+		}
 	}
 
 	return collected, nil

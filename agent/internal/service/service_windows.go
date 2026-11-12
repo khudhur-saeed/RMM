@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -141,7 +142,12 @@ func (m *windowsManager) Install() error {
 		Description:  m.description,
 	}
 
-	serviceHandle, err = scManager.CreateService(m.name, execPath, cfg)
+	quotedPath := execPath
+	if !strings.HasPrefix(quotedPath, "\"") {
+		quotedPath = fmt.Sprintf("\"%s\"", execPath)
+	}
+
+	serviceHandle, err = scManager.CreateService(m.name, quotedPath, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create windows service: %w", err)
 	}

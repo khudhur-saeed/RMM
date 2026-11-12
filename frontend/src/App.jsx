@@ -6,8 +6,6 @@ import UserManagement from './components/UserManagement';
 import RolePermissions from './components/RolePermissions';
 import AuditLogExplorer from './components/AuditLogExplorer';
 
-const DEFAULT_DEV_TOKEN = 'rmm_admin_dev_token_2026';
-
 function NavItem({ to, label, icon }) {
   const location = useLocation();
   const isActive = location.pathname.startsWith(to);
@@ -37,7 +35,8 @@ function NavItem({ to, label, icon }) {
 
 function App() {
   const [operatorToken, setOperatorToken] = useState(() => {
-    return sessionStorage.getItem('rmm_operator_token') || DEFAULT_DEV_TOKEN;
+    const saved = sessionStorage.getItem('rmm_operator_token');
+    return saved !== null ? saved : 'rmm_admin_dev_token_2026';
   });
 
   const [principal, setPrincipal] = useState(null);

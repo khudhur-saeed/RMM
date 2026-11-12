@@ -1,6 +1,7 @@
 package authmon
 
 import (
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -21,6 +22,33 @@ var (
 	reSudoFailed = regexp.MustCompile(`sudo:.*authentication failure.*user=(\S+)`)
 )
 
+// extractSyslogTimestamp extracts the timestamp from traditional or RFC5424/RFC3339 syslog lines.
+func extractSyslogTimestamp(line string) string {
+	fields := strings.Fields(line)
+	if len(fields) >= 3 {
+		// RFC3339 timestamp (single field)
+		if t, err := time.Parse(time.RFC3339, fields[0]); err == nil {
+			return t.UTC().Format(time.RFC3339)
+		}
+		if t, err := time.Parse("2006-01-02T15:04:05.999999-07:00", fields[0]); err == nil {
+			return t.UTC().Format(time.RFC3339)
+		}
+
+		// Traditional syslog timestamp ("Oct 11 14:32:01")
+		dateStr := fmt.Sprintf("%s %s %s", fields[0], fields[1], fields[2])
+		if t, err := time.Parse(time.Stamp, dateStr); err == nil {
+			now := time.Now().UTC()
+			year := now.Year()
+			if now.Month() == time.January && t.Month() == time.December {
+				year--
+			}
+			parsed := time.Date(year, t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)
+			return parsed.Format(time.RFC3339)
+		}
+	}
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
 // ParseAuthLine inspects a single log line from auth.log/secure and extracts security events.
 func ParseAuthLine(line string) (*AuthEvent, bool) {
 	trimmed := strings.TrimSpace(line)
@@ -28,7 +56,7 @@ func ParseAuthLine(line string) (*AuthEvent, bool) {
 		return nil, false
 	}
 
-	timestamp := time.Now().UTC().Format(time.RFC3339)
+	timestamp := extractSyslogTimestamp(trimmed)
 
 	// 1. Check SSH Login Success
 	if matches := reSSHSuccess.FindStringSubmatch(trimmed); len(matches) == 4 {
